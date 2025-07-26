@@ -8,8 +8,8 @@
 
 #define WIDTH 800
 #define HEIGHT 600
-#define RADIUS 6
-#define NUM_PARTICLES 500
+#define RADIUS 8
+#define NUM_PARTICLES 10
 #define PARTICLE_RADIUS 1.5f*RADIUS
 #define DIAMETER (RADIUS * 2)
 #define GRAVITY 0.2f
@@ -20,7 +20,7 @@
 #define FRAME_TIME 8
 #define RECORD_SECONDS 6
 
-bool use_gravity = false;
+bool use_gravity = true;
 bool use_boundaries = true;
 
 typedef struct {
@@ -31,18 +31,17 @@ typedef struct {
 } Particle;
 
 Particle particles[NUM_PARTICLES];
+float prev_positions[NUM_PARTICLES][2];
 
 void init_particles() {
     srand((unsigned int)time(NULL));
     const int max_attempts = 1000;
     const float min_dist = 2.5f * PARTICLE_RADIUS;
 
-    // Bereich für Spawn: Breite = 240, Höhe = 120
-    // Mitte des Bereichs auf Fensterzentrum setzen
     const float spawn_width = 240;
     const float spawn_height = 120;
-    const float spawn_x_min = (WIDTH / 2.0f) - (spawn_width / 2.0f);  // 400 - 120 = 280
-    const float spawn_y_min = (HEIGHT / 2.0f) - (spawn_height / 2.0f); // 300 - 60 = 240
+    const float spawn_x_min = (WIDTH / 2.0f) - (spawn_width / 2.0f);
+    const float spawn_y_min = (HEIGHT / 2.0f) - (spawn_height / 2.0f);
 
     for (int i = 0; i < NUM_PARTICLES; i++) {
         int attempts = 0;
@@ -75,6 +74,9 @@ void init_particles() {
         particles[i].r = 128 + rand() % 128;
         particles[i].g = 128 + rand() % 128;
         particles[i].b = 128 + rand() % 128;
+
+        prev_positions[i][0] = particles[i].x / (float)WIDTH;
+        prev_positions[i][1] = particles[i].y / (float)HEIGHT;
     }
 }
 
@@ -176,9 +178,10 @@ void draw_particles(SDL_Renderer *renderer) {
 void save_frame(FILE *file, int frame, int total_frames) {
     fprintf(file, "{\"inputs\": [");
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        fprintf(file, "%s%.2f,%.2f,%.2f,%.2f", i == 0 ? "" : ",",
-            particles[i].x, particles[i].y,
-            particles[i].vx, particles[i].vy);
+        float x_norm = particles[i].x / (float)WIDTH;
+        float y_norm = particles[i].y / (float)HEIGHT;
+
+        fprintf(file, "%s%.5f,%.5f", i == 0 ? "" : ",", x_norm, y_norm);
     }
 
     compute_forces();
@@ -186,9 +189,16 @@ void save_frame(FILE *file, int frame, int total_frames) {
 
     fprintf(file, "], \"targets\": [");
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        fprintf(file, "%s%.2f,%.2f,%.2f,%.2f", i == 0 ? "" : ",",
-            particles[i].x, particles[i].y,
-            particles[i].vx, particles[i].vy);
+        float x_norm = particles[i].x / (float)WIDTH;
+        float y_norm = particles[i].y / (float)HEIGHT;
+
+        float dx = x_norm - prev_positions[i][0];
+        float dy = y_norm - prev_positions[i][1];
+
+        fprintf(file, "%s%.5f,%.5f", i == 0 ? "" : ",", dx, dy);
+
+        prev_positions[i][0] = x_norm;
+        prev_positions[i][1] = y_norm;
     }
     fprintf(file, "]}%s\n", frame == total_frames - 1 ? "" : ",");
 }

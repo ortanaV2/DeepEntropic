@@ -3,21 +3,15 @@ import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 import time
-import sys
 
 WIDTH = 1200
 HEIGHT = 1000
-NUM_PARTICLES = int(sys.argv[1])
 RADIUS = 6
 DIAMETER = RADIUS * 2
 
 FRAME_TIME = 0.016  # 16 ms per frame
 RECORD_SECONDS = 10
 TOTAL_FRAMES = int(RECORD_SECONDS / FRAME_TIME)
-
-INPUT_SIZE = NUM_PARTICLES * 4  # x, y, vx, vy per particle
-HIDDEN_SIZE = 512
-OUTPUT_SIZE = NUM_PARTICLES * 4  # Δx, Δy, Δvx, Δvy
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -66,39 +60,54 @@ def init_centered_particles(num_particles, radius, width, height):
                 positions.append((x, y))
                 break
         else:
-            positions.append((x, y))  # Place anyway
+            positions.append((x, y))  # Place anyway if no valid found
 
     return np.array(positions, dtype=np.float32)
+
+def normalize_positions(positions):
+    norm_x = positions[:, 0] / WIDTH
+    norm_y = positions[:, 1] / HEIGHT
+    return np.stack([norm_x, norm_y], axis=1)
+
+def denormalize_positions(norm_positions):
+    x = norm_positions[:, 0] * WIDTH
+    y = norm_positions[:, 1] * HEIGHT
+    return np.stack([x, y], axis=1)
 
 def main():
     model = torch.load("particle_model_full.pt", map_location=device)
     model.eval()
 
-    positions = np.zeros((NUM_PARTICLES, 2), dtype=np.float32)
-    velocities = np.zeros((NUM_PARTICLES, 2), dtype=np.float32)
+    input_size = model.net[0].in_features
+    NUM_PARTICLES = input_size // 2
 
     positions = init_centered_particles(NUM_PARTICLES, RADIUS, WIDTH, HEIGHT)
+    velocities = np.zeros((NUM_PARTICLES, 2), dtype=np.float32)
+
+    norm_positions = normalize_positions(positions)
 
     plt.ion()
     fig, ax = plt.subplots(figsize=(8, 6))
     scatter = ax.scatter(positions[:, 0], positions[:, 1], s=RADIUS*4, c='cyan', edgecolors='b')
     ax.set_xlim(0, WIDTH)
     ax.set_ylim(0, HEIGHT)
+    ax.invert_yaxis()
     ax.set_aspect('equal')
 
     for frame in range(TOTAL_FRAMES):
-        input_data = np.hstack((positions, velocities)).flatten()
+        input_data = norm_positions.flatten()
         inp = torch.tensor(input_data, dtype=torch.float32, device=device).unsqueeze(0)
 
         with torch.no_grad():
-            out = model(inp).cpu().numpy().reshape(NUM_PARTICLES, 4)
+            delta = model(inp).cpu().numpy().reshape(NUM_PARTICLES, 2)
 
-        delta_pos = out[:, 0:2]
-        delta_vel = out[:, 2:4]
+        norm_positions += delta
 
-        velocities += delta_vel
-        positions += delta_pos
+        norm_positions = np.clip(norm_positions, [RADIUS/WIDTH, RADIUS/HEIGHT], [1 - RADIUS/WIDTH, 1 - RADIUS/HEIGHT])
+
+        positions = denormalize_positions(norm_positions)
         positions = clamp_positions(positions)
+        norm_positions = normalize_positions(positions)
 
         scatter.set_offsets(positions)
         ax.set_title(f"Frame {frame+1}/{TOTAL_FRAMES}")
