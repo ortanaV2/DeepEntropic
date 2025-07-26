@@ -101,14 +101,16 @@ def train(json_path, input_mode="xyv", hidden_size=512, epochs=50, batch_size=64
     torch.save(model, "particle_model_full.pt")
     return model
 
+
 def main():
     parser = argparse.ArgumentParser(description="Train ParticleNet on simulation data.")
-    parser.add_argument("--dataset_path", type=str, required=False, default="./simulation_data.json", help="Pfad zur Simulationsdaten-Datei (z.B. simulation_data.json)")
-    parser.add_argument("--input_mode", type=str, required=False, default="xyv", help="Eingabemodus (default: xyv)")
+    parser.add_argument("--dataset_path", type=str, default="./simulation_data.json", help="Simulation data path (dataset)")
+    parser.add_argument("--input_mode", type=str, default="xyv", help="dataset configuration standard: xy ; incl. velocities: xyv")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
 
     args = parser.parse_args()
 
-    model = train(args.dataset_path, input_mode=args.input_mode)
+    model = train(args.dataset_path, input_mode=args.input_mode, epochs=args.epochs)
 
 if __name__ == "__main__":
     main()

@@ -5,13 +5,13 @@ import matplotlib.pyplot as plt
 import time
 import sys
 
-WIDTH = 800
-HEIGHT = 600
+WIDTH = 1200
+HEIGHT = 1000
 NUM_PARTICLES = int(sys.argv[1])
 RADIUS = 6
 DIAMETER = RADIUS * 2
 
-FRAME_TIME = 1  # 16 ms per frame
+FRAME_TIME = 0.016  # 16 ms per frame
 RECORD_SECONDS = 10
 TOTAL_FRAMES = int(RECORD_SECONDS / FRAME_TIME)
 
@@ -44,6 +44,32 @@ def clamp_positions(positions):
     positions[:, 1] = np.clip(positions[:, 1], RADIUS, HEIGHT - RADIUS)
     return positions
 
+def init_centered_particles(num_particles, radius, width, height):
+    spawn_width = 240
+    spawn_height = 120
+    spawn_x_min = (width / 2.0) - (spawn_width / 2.0)
+    spawn_y_min = (height / 2.0) - (spawn_height / 2.0)
+    min_dist = 2.5 * radius
+    max_attempts = 1000
+
+    positions = []
+    for i in range(num_particles):
+        for attempt in range(max_attempts):
+            x = np.random.uniform(spawn_x_min, spawn_x_min + spawn_width)
+            y = np.random.uniform(spawn_y_min, spawn_y_min + spawn_height)
+            valid = True
+            for px, py in positions:
+                if (x - px)**2 + (y - py)**2 < min_dist**2:
+                    valid = False
+                    break
+            if valid:
+                positions.append((x, y))
+                break
+        else:
+            positions.append((x, y))  # Place anyway
+
+    return np.array(positions, dtype=np.float32)
+
 def main():
     model = torch.load("particle_model_full.pt", map_location=device)
     model.eval()
@@ -51,8 +77,7 @@ def main():
     positions = np.zeros((NUM_PARTICLES, 2), dtype=np.float32)
     velocities = np.zeros((NUM_PARTICLES, 2), dtype=np.float32)
 
-    positions[:, 0] = np.random.uniform(300, 500, NUM_PARTICLES)
-    positions[:, 1] = np.random.uniform(50, 150, NUM_PARTICLES)
+    positions = init_centered_particles(NUM_PARTICLES, RADIUS, WIDTH, HEIGHT)
 
     plt.ion()
     fig, ax = plt.subplots(figsize=(8, 6))

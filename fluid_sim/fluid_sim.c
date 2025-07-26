@@ -8,8 +8,9 @@
 
 #define WIDTH 800
 #define HEIGHT 600
-#define NUM_PARTICLES 100
 #define RADIUS 6
+#define NUM_PARTICLES 500
+#define PARTICLE_RADIUS 1.5f*RADIUS
 #define DIAMETER (RADIUS * 2)
 #define GRAVITY 0.2f
 #define PRESSURE 0.25f
@@ -17,9 +18,9 @@
 #define DAMPING 0.2f
 
 #define FRAME_TIME 8
-#define RECORD_SECONDS 4
+#define RECORD_SECONDS 6
 
-bool use_gravity = true;
+bool use_gravity = false;
 bool use_boundaries = true;
 
 typedef struct {
@@ -33,9 +34,42 @@ Particle particles[NUM_PARTICLES];
 
 void init_particles() {
     srand((unsigned int)time(NULL));
+    const int max_attempts = 1000;
+    const float min_dist = 2.5f * PARTICLE_RADIUS;
+
+    // Bereich für Spawn: Breite = 240, Höhe = 120
+    // Mitte des Bereichs auf Fensterzentrum setzen
+    const float spawn_width = 240;
+    const float spawn_height = 120;
+    const float spawn_x_min = (WIDTH / 2.0f) - (spawn_width / 2.0f);  // 400 - 120 = 280
+    const float spawn_y_min = (HEIGHT / 2.0f) - (spawn_height / 2.0f); // 300 - 60 = 240
+
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        particles[i].x = 300 + rand() % 200;
-        particles[i].y = 50 + rand() % 100;
+        int attempts = 0;
+        bool valid;
+
+        do {
+            valid = true;
+            float x = spawn_x_min + (rand() % (int)spawn_width);
+            float y = spawn_y_min + (rand() % (int)spawn_height);
+
+            for (int j = 0; j < i; j++) {
+                float dx = particles[j].x - x;
+                float dy = particles[j].y - y;
+                float dist_sq = dx * dx + dy * dy;
+                if (dist_sq < min_dist * min_dist) {
+                    valid = false;
+                    break;
+                }
+            }
+
+            if (valid || ++attempts > max_attempts) {
+                particles[i].x = x;
+                particles[i].y = y;
+                break;
+            }
+        } while (true);
+
         particles[i].vx = particles[i].vy = 0;
         particles[i].fx = particles[i].fy = 0;
         particles[i].r = 128 + rand() % 128;
