@@ -4,19 +4,23 @@
 #include <stdlib.h>
 #include <time.h>
 #include <omp.h>
+#include <stdbool.h>
 
 #define WIDTH 800
 #define HEIGHT 600
-#define NUM_PARTICLES 2000
+#define NUM_PARTICLES 100
 #define RADIUS 6
 #define DIAMETER (RADIUS * 2)
 #define GRAVITY 0.2f
-#define PRESSURE 0.04f
+#define PRESSURE 0.25f
 #define VISCOSITY 0.03f
 #define DAMPING 0.2f
 
-#define FRAME_TIME 16
-#define RECORD_SECONDS 10
+#define FRAME_TIME 8
+#define RECORD_SECONDS 4
+
+bool use_gravity = true;
+bool use_boundaries = true;
 
 typedef struct {
     float x, y;
@@ -53,7 +57,7 @@ void compute_forces() {
     #pragma omp parallel for
     for (int i = 0; i < NUM_PARTICLES; i++) {
         particles[i].fx = 0;
-        particles[i].fy = GRAVITY;
+        particles[i].fy = use_gravity ? GRAVITY : 0;
     }
 
     #pragma omp parallel for schedule(dynamic)
@@ -107,21 +111,23 @@ void update_particles() {
         p->x += p->vx;
         p->y += p->vy;
 
-        if (p->x < RADIUS) {
-            p->x = RADIUS;
-            p->vx *= -DAMPING;
-        }
-        if (p->x > WIDTH - RADIUS) {
-            p->x = WIDTH - RADIUS;
-            p->vx *= -DAMPING;
-        }
-        if (p->y > HEIGHT - RADIUS) {
-            p->y = HEIGHT - RADIUS;
-            p->vy *= -DAMPING;
-        }
-        if (p->y < RADIUS) {
-            p->y = RADIUS;
-            p->vy *= -DAMPING;
+        if (use_boundaries) {
+            if (p->x < RADIUS) {
+                p->x = RADIUS;
+                p->vx *= -DAMPING;
+            }
+            if (p->x > WIDTH - RADIUS) {
+                p->x = WIDTH - RADIUS;
+                p->vx *= -DAMPING;
+            }
+            if (p->y > HEIGHT - RADIUS) {
+                p->y = HEIGHT - RADIUS;
+                p->vy *= -DAMPING;
+            }
+            if (p->y < RADIUS) {
+                p->y = RADIUS;
+                p->vy *= -DAMPING;
+            }
         }
     }
 }
@@ -136,7 +142,9 @@ void draw_particles(SDL_Renderer *renderer) {
 void save_frame(FILE *file, int frame, int total_frames) {
     fprintf(file, "{\"inputs\": [");
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        fprintf(file, "%s%.2f,%.2f", i == 0 ? "" : ",", particles[i].x, particles[i].y);
+        fprintf(file, "%s%.2f,%.2f,%.2f,%.2f", i == 0 ? "" : ",",
+            particles[i].x, particles[i].y,
+            particles[i].vx, particles[i].vy);
     }
 
     compute_forces();
@@ -144,7 +152,9 @@ void save_frame(FILE *file, int frame, int total_frames) {
 
     fprintf(file, "], \"targets\": [");
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        fprintf(file, "%s%.2f,%.2f", i == 0 ? "" : ",", particles[i].x, particles[i].y);
+        fprintf(file, "%s%.2f,%.2f,%.2f,%.2f", i == 0 ? "" : ",",
+            particles[i].x, particles[i].y,
+            particles[i].vx, particles[i].vy);
     }
     fprintf(file, "]}%s\n", frame == total_frames - 1 ? "" : ",");
 }
