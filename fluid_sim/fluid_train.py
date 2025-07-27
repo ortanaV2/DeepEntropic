@@ -44,7 +44,7 @@ class ParticleDataset(Dataset):
         self.targets = torch.tensor([s[1] for s in self.samples], dtype=torch.float32)
 
         self.features_per_particle = features_per_particle
-        self.num_particles = len(self.inputs[0]) // features_per_particle
+        self.num_particles = len(self.inputs[0]) // features_per_particle * 2
 
     def __len__(self):
         return len(self.inputs)
