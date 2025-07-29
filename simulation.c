@@ -6,6 +6,8 @@
 #include <omp.h>
 #include <stdbool.h>
 #include <sqlite3.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 #define WIDTH 800
 #define HEIGHT 600
@@ -63,8 +65,16 @@ void free_frame_buffers(int total_frames) {
     free(all_targets);
 }
 
+void init_random_seed() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    unsigned int seed = (unsigned int)(tv.tv_sec ^ tv.tv_usec ^ getpid());
+    srand(seed);
+}
+
 void init_particles() {
-    srand((unsigned int)time(NULL));
+    init_random_seed();
+
     const int max_attempts = 1000;
     const float min_dist = 2.5f * PARTICLE_RADIUS;
 
