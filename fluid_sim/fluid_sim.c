@@ -5,12 +5,13 @@
 #include <time.h>
 #include <omp.h>
 #include <stdbool.h>
+#include <sqlite3.h>
 
 #define WIDTH 800
 #define HEIGHT 600
 #define RADIUS 14
 #define NUM_PARTICLES 10
-#define PARTICLE_RADIUS 2.0f*RADIUS
+#define PARTICLE_RADIUS (2.0f * RADIUS)
 #define DIAMETER (RADIUS * 2)
 #define GRAVITY 0.2f
 #define PRESSURE 0.25f
@@ -32,6 +33,35 @@ typedef struct {
 
 Particle particles[NUM_PARTICLES];
 float prev_positions[NUM_PARTICLES][2];
+
+sqlite3 *db = NULL;
+
+#define MAX_FRAMES ((RECORD_SECONDS * 1000) / FRAME_TIME)
+
+float **all_inputs = NULL;
+float **all_targets = NULL;
+
+void allocate_frame_buffers(int total_frames) {
+    all_inputs = malloc(sizeof(float*) * total_frames);
+    all_targets = malloc(sizeof(float*) * total_frames);
+    for (int i = 0; i < total_frames; i++) {
+        all_inputs[i] = malloc(NUM_PARTICLES * 2 * sizeof(float));
+        all_targets[i] = malloc(NUM_PARTICLES * 2 * sizeof(float));
+        if (!all_inputs[i] || !all_targets[i]) {
+            fprintf(stderr, "Memory allocation failed for frame %d\n", i);
+            exit(1);
+        }
+    }
+}
+
+void free_frame_buffers(int total_frames) {
+    for (int i = 0; i < total_frames; i++) {
+        free(all_inputs[i]);
+        free(all_targets[i]);
+    }
+    free(all_inputs);
+    free(all_targets);
+}
 
 void init_particles() {
     srand((unsigned int)time(NULL));
@@ -69,8 +99,10 @@ void init_particles() {
             }
         } while (true);
 
-        particles[i].vx = particles[i].vy = 0;
-        particles[i].fx = particles[i].fy = 0;
+        particles[i].vx = 0;
+        particles[i].vy = 0;
+        particles[i].fx = 0;
+        particles[i].fy = 0;
         particles[i].r = 128 + rand() % 128;
         particles[i].g = 128 + rand() % 128;
         particles[i].b = 128 + rand() % 128;
@@ -175,48 +207,123 @@ void draw_particles(SDL_Renderer *renderer) {
     }
 }
 
-void save_frame(FILE *file, int frame, int total_frames) {
-    fprintf(file, "{\"inputs\": [");
-    for (int i = 0; i < NUM_PARTICLES; i++) {
-        float x_norm = particles[i].x / (float)WIDTH;
-        float y_norm = particles[i].y / (float)HEIGHT;
+void save_frame_to_buffer(int frame) {
+    int num_floats = NUM_PARTICLES * 2;
+    float *inputs = all_inputs[frame];
+    float *targets = all_targets[frame];
 
-        fprintf(file, "%s%.5f,%.5f", i == 0 ? "" : ",", x_norm, y_norm);
+    for (int i = 0; i < NUM_PARTICLES; i++) {
+        inputs[i*2]   = particles[i].x / (float)WIDTH;
+        inputs[i*2+1] = particles[i].y / (float)HEIGHT;
     }
 
     compute_forces();
     update_particles();
 
-    fprintf(file, "], \"targets\": [");
     for (int i = 0; i < NUM_PARTICLES; i++) {
         float x_norm = particles[i].x / (float)WIDTH;
         float y_norm = particles[i].y / (float)HEIGHT;
 
-        float dx = x_norm - prev_positions[i][0];
-        float dy = y_norm - prev_positions[i][1];
-
-        fprintf(file, "%s%.5f,%.5f", i == 0 ? "" : ",", dx, dy);
+        targets[i*2]   = x_norm - prev_positions[i][0];
+        targets[i*2+1] = y_norm - prev_positions[i][1];
 
         prev_positions[i][0] = x_norm;
         prev_positions[i][1] = y_norm;
     }
-    fprintf(file, "]}%s\n", frame == total_frames - 1 ? "" : ",");
+}
+
+int write_all_frames_to_db(int total_frames) {
+    const char *sql = "INSERT INTO drop_10p_dataset (inputs, targets) VALUES (?, ?);";
+    sqlite3_stmt *stmt;
+    int rc;
+
+    rc = sqlite3_exec(db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to begin transaction: %s\n", sqlite3_errmsg(db));
+        return rc;
+    }
+
+    rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        return rc;
+    }
+
+    for (int i = 0; i < total_frames; i++) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+
+        sqlite3_bind_blob(stmt, 1, all_inputs[i], NUM_PARTICLES * 2 * sizeof(float), SQLITE_STATIC);
+        sqlite3_bind_blob(stmt, 2, all_targets[i], NUM_PARTICLES * 2 * sizeof(float), SQLITE_STATIC);
+
+        rc = sqlite3_step(stmt);
+        if (rc != SQLITE_DONE) {
+            fprintf(stderr, "Failed to execute statement at frame %d: %s\n", i, sqlite3_errmsg(db));
+            sqlite3_finalize(stmt);
+            sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+            return rc;
+        }
+    }
+
+    sqlite3_finalize(stmt);
+
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to commit transaction: %s\n", sqlite3_errmsg(db));
+        return rc;
+    }
+
+    return SQLITE_OK;
 }
 
 int main(int argc, char *argv[]) {
-    SDL_Init(SDL_INIT_VIDEO);
-    SDL_Window *window = SDL_CreateWindow("Simulation", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH, HEIGHT, SDL_WINDOW_SHOWN);
-    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-    init_particles();
-
-    FILE *outfile = fopen("simulation_data.json", "w");
-    if (!outfile) {
-        fprintf(stderr, "Failed to open file for writing.\n");
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "SDL_Init Error: %s\n", SDL_GetError());
         return 1;
     }
-    fprintf(outfile, "[\n");
 
-    int total_frames = (RECORD_SECONDS * 1000) / FRAME_TIME;
+    if (sqlite3_open("dataset.db", &db) != SQLITE_OK) {
+        fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);  // enable parallel db-writing
+
+    const char *sql_create = 
+        "CREATE TABLE IF NOT EXISTS drop_10p_dataset ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "inputs BLOB NOT NULL,"
+        "targets BLOB NOT NULL);";
+    char *err_msg = NULL;
+    if (sqlite3_exec(db, sql_create, 0, 0, &err_msg) != SQLITE_OK) {
+        fprintf(stderr, "Failed to create table: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        sqlite3_close(db);
+        return 1;
+    }
+
+    SDL_Window *window = SDL_CreateWindow("Simulation", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                          WIDTH, HEIGHT, SDL_WINDOW_SHOWN);
+    if (!window) {
+        fprintf(stderr, "SDL_CreateWindow Error: %s\n", SDL_GetError());
+        sqlite3_close(db);
+        return 1;
+    }
+
+    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    if (!renderer) {
+        fprintf(stderr, "SDL_CreateRenderer Error: %s\n", SDL_GetError());
+        SDL_DestroyWindow(window);
+        sqlite3_close(db);
+        return 1;
+    }
+
+    init_particles();
+
+    int total_frames = MAX_FRAMES;
+    allocate_frame_buffers(total_frames);
+
     for (int frame = 0; frame < total_frames; frame++) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -228,16 +335,22 @@ int main(int argc, char *argv[]) {
         SDL_SetRenderDrawColor(renderer, 20, 20, 30, 255);
         SDL_RenderClear(renderer);
 
-        save_frame(outfile, frame, total_frames);
+        save_frame_to_buffer(frame);
 
         SDL_Delay(FRAME_TIME);
     }
 
 done:
-    fprintf(outfile, "\n]\n");
-    fclose(outfile);
+    if (write_all_frames_to_db(total_frames) != SQLITE_OK) {
+        fprintf(stderr, "Error writing frames to database\n");
+    }
+
+    free_frame_buffers(total_frames);
+
+    sqlite3_close(db);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();
+
     return 0;
 }
