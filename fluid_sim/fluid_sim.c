@@ -8,9 +8,9 @@
 
 #define WIDTH 800
 #define HEIGHT 600
-#define RADIUS 8
+#define RADIUS 14
 #define NUM_PARTICLES 10
-#define PARTICLE_RADIUS 1.5f*RADIUS
+#define PARTICLE_RADIUS 2.0f*RADIUS
 #define DIAMETER (RADIUS * 2)
 #define GRAVITY 0.2f
 #define PRESSURE 0.25f
@@ -18,7 +18,7 @@
 #define DAMPING 0.2f
 
 #define FRAME_TIME 8
-#define RECORD_SECONDS 6
+#define RECORD_SECONDS 7
 
 bool use_gravity = true;
 bool use_boundaries = true;

@@ -44,7 +44,7 @@ class ParticleDataset(Dataset):
         self.targets = torch.tensor([s[1] for s in self.samples], dtype=torch.float32)
 
         self.features_per_particle = features_per_particle
-        self.num_particles = len(self.inputs[0]) // features_per_particle * 2
+        self.num_particles = len(self.inputs[0]) // features_per_particle
 
     def __len__(self):
         return len(self.inputs)
@@ -81,7 +81,7 @@ def train(json_path, input_mode="xyd", hidden_size=512, epochs=50, batch_size=64
     input_size = NUM_PARTICLES * FEATURES_IN
     output_size = NUM_PARTICLES * FEATURES_OUT
 
-    print(f"Detected: {NUM_PARTICLES} particles, {FEATURES_IN} input / {FEATURES_OUT} output features per particle")
+    print(f"Detected: {NUM_PARTICLES*2} particles, {FEATURES_IN} input / {FEATURES_OUT} output features per particle")
 
     model = ParticleNet(input_size, hidden_size, output_size).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)

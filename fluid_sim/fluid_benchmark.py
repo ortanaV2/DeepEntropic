@@ -3,10 +3,11 @@ import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 import time
+import os
 
 WIDTH = 1200
 HEIGHT = 1000
-RADIUS = 6
+RADIUS = 14
 DIAMETER = RADIUS * 2
 
 FRAME_TIME = 0.016  # 16 ms per frame
@@ -43,7 +44,7 @@ def init_centered_particles(num_particles, radius, width, height):
     spawn_height = 120
     spawn_x_min = (width / 2.0) - (spawn_width / 2.0)
     spawn_y_min = (height / 2.0) - (spawn_height / 2.0)
-    min_dist = 2.5 * radius
+    min_dist = 2.0 * radius
     max_attempts = 1000
 
     positions = []
@@ -75,7 +76,10 @@ def denormalize_positions(norm_positions):
     return np.stack([x, y], axis=1)
 
 def main():
-    model = torch.load("particle_model_full.pt", map_location=device)
+    pt_files = [f for f in os.listdir() if f.endswith(".pt")]
+    if not pt_files:
+        raise FileNotFoundError("No .pt file found in the current directory.")
+    model = torch.load(pt_files[0], map_location=device)
     model.eval()
 
     input_size = model.net[0].in_features
@@ -113,7 +117,7 @@ def main():
         ax.set_title(f"Frame {frame+1}/{TOTAL_FRAMES}")
         fig.canvas.draw()
         fig.canvas.flush_events()
-        time.sleep(FRAME_TIME)
+        # time.sleep(FRAME_TIME)  #! DEBUG DECOMMENT
 
     plt.ioff()
     plt.show()
