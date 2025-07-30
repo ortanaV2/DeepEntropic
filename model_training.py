@@ -1,61 +1,45 @@
 import argparse
-import json
 import sqlite3
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import datetime
+from torch.utils.data import Dataset, DataLoader, random_split
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-class SQLiteParticleDataset(Dataset):
-    def __init__(self, db_path, chunk_size=3500):
+class FullRAMParticleDataset(Dataset):
+    def __init__(self, db_path, max_frames=None):
         self.conn = sqlite3.connect(db_path)
         self.cursor = self.conn.cursor()
-        self.chunk_size = chunk_size
 
         self.cursor.execute("SELECT COUNT(*) FROM drop_10p_dataset")
-        self.total_samples = self.cursor.fetchone()[0]
+        total_samples = self.cursor.fetchone()[0]
+
+        if max_frames is not None and max_frames < total_samples:
+            self.total_samples = max_frames
+        else:
+            self.total_samples = total_samples
 
         self.features_per_particle = 4
-        self.buffer_start = -1
-        self.buffer = []
 
-        self._load_chunk(0)
-        self.num_particles = len(self.buffer[0][0]) // self.features_per_particle if self.buffer else 0
-
-    def _load_chunk(self, start_idx):
-        self.buffer_start = start_idx
-        self.buffer = []
-
-        query = f"SELECT inputs, targets FROM drop_10p_dataset LIMIT {self.chunk_size} OFFSET {start_idx}"
+        query = f"SELECT inputs, targets FROM drop_10p_dataset LIMIT {self.total_samples}"
         rows = self.cursor.execute(query).fetchall()
 
-        for row in rows:
-            inputs_blob = row[0]
-            targets_blob = row[1]
+        self.data = []
+        for inputs_blob, targets_blob in rows:
+            inputs = torch.frombuffer(inputs_blob, dtype=torch.float32)
+            targets = torch.frombuffer(targets_blob, dtype=torch.float32)
+            self.data.append((inputs, targets))
 
-            inputs = list(torch.frombuffer(inputs_blob, dtype=torch.float32).numpy())
-            targets = list(torch.frombuffer(targets_blob, dtype=torch.float32).numpy())
-
-            filtered_input = []
-            filtered_target = []
-
-            for i in range(0, len(inputs), 4):
-                filtered_input.extend(inputs[i:i+4])
-                filtered_target.extend(targets[i:i+4])
-
-            self.buffer.append((filtered_input, filtered_target))
+        self.num_particles = len(self.data[0][0]) // self.features_per_particle if self.data else 0
 
     def __len__(self):
         return self.total_samples
 
     def __getitem__(self, idx):
-        if not (self.buffer_start <= idx < self.buffer_start + self.chunk_size):
-            self._load_chunk(idx)
-        local_idx = idx - self.buffer_start
-        x, y = self.buffer[local_idx]
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+        x, y = self.data[idx]
+        return x.float(), y.float()
 
 class ParticleNet(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -75,9 +59,15 @@ class ParticleNet(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-def train(db_path, hidden_size=512, epochs=50, batch_size=64, lr=1e-4):
-    dataset = SQLiteParticleDataset(db_path)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+def train(db_path, max_frames=None, hidden_size=512, epochs=50, batch_size=64, lr=1e-4, early_stop_patience=5):
+    dataset = FullRAMParticleDataset(db_path, max_frames=max_frames)
+    val_ratio = 0.1
+    val_size = int(len(dataset) * val_ratio)
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     FEATURES_IN = dataset.features_per_particle
     FEATURES_OUT = dataset.features_per_particle
@@ -87,15 +77,20 @@ def train(db_path, hidden_size=512, epochs=50, batch_size=64, lr=1e-4):
     output_size = NUM_PARTICLES * FEATURES_OUT
 
     print(f"Detected: {NUM_PARTICLES*2} particles, {FEATURES_IN} input / {FEATURES_OUT} output features per particle")
+    print(f"Using {len(dataset)} samples (max_frames={max_frames}), split: {train_size} train / {val_size} val")
 
     model = ParticleNet(input_size, hidden_size, output_size).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.9)
     loss_fn = nn.MSELoss()
 
+    best_val_loss = float('inf')
+    patience_counter = 0
+
     for epoch in range(epochs):
+        model.train()
         total_loss = 0
-        for x, y in dataloader:
+        for x, y in train_loader:
             x = x.to(device)
             y = y.to(device)
 
@@ -106,10 +101,33 @@ def train(db_path, hidden_size=512, epochs=50, batch_size=64, lr=1e-4):
             optimizer.step()
             total_loss += loss.item()
 
-        print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}")
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for x_val, y_val in val_loader:
+                x_val = x_val.to(device)
+                y_val = y_val.to(device)
+                pred_val = model(x_val)
+                loss = loss_fn(pred_val, y_val)
+                val_loss += loss.item()
+
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{now_str}] Epoch {epoch+1}, Train Loss: {total_loss:.4f}, Val Loss: {val_loss:.4f}")
         scheduler.step()
 
-    torch.save(model, "particle_model_full.pt")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), "ptc_model_best_state.pt")
+        else:
+            patience_counter += 1
+            if patience_counter >= early_stop_patience:
+                print("Early stopping triggered.")
+                break
+
+    print("Training done. Loading best model.")
+    model.load_state_dict(torch.load("ptc_model_best_state.pt"))
+    torch.save(model, "ptc_model_full.pt")
     return model
 
 def main():
@@ -119,9 +137,19 @@ def main():
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
     parser.add_argument("--hidden_size", type=int, default=512, help="Hidden layer size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--max_frames", type=int, default=None, help="Max number of frames to load from DB (default: all)")
+    parser.add_argument("--early_stop_patience", type=int, default=5, help="Patience for early stopping")
 
     args = parser.parse_args()
-    train(args.db_path, hidden_size=args.hidden_size, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+    train(
+        args.db_path,
+        max_frames=args.max_frames,
+        hidden_size=args.hidden_size,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        early_stop_patience=args.early_stop_patience
+    )
 
 if __name__ == "__main__":
     main()

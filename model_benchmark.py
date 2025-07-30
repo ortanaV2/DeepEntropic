@@ -86,8 +86,6 @@ def main():
     NUM_PARTICLES = input_size // 2
 
     positions = init_centered_particles(NUM_PARTICLES, RADIUS, WIDTH, HEIGHT)
-    velocities = np.zeros((NUM_PARTICLES, 2), dtype=np.float32)
-
     norm_positions = normalize_positions(positions)
 
     plt.ion()
