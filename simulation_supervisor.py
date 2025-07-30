@@ -13,7 +13,7 @@ def run_parallel_batch(batch_size, batch_num, total_batches):
     procs = []
     for i in range(batch_size):
         print(f"  -> Starting simulation {i+1} in batch {batch_num}...")
-        time.sleep(0.1)
+        time.sleep(0.05)
         p = subprocess.Popen(["./simulation.exe"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         procs.append((i+1, p))
 
@@ -38,6 +38,6 @@ def run_all_batches(total_batches, batch_size, delay_between_batches=0.25):
             time.sleep(delay_between_batches)
 
 if __name__ == "__main__":
-    total_batches = 8500
-    batch_size = 5
+    total_batches = 1000
+    batch_size = 25
     run_all_batches(total_batches, batch_size)

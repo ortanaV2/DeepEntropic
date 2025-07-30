@@ -25,6 +25,7 @@
 
 bool use_gravity = true;
 bool use_boundaries = true;
+bool enable_visualization = false;
 
 typedef struct {
     float x, y;
@@ -288,9 +289,14 @@ int write_all_frames_to_db(int total_frames) {
 }
 
 int main(int argc, char *argv[]) {
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-        fprintf(stderr, "SDL_Init Error: %s\n", SDL_GetError());
-        return 1;
+    SDL_Window *window = NULL;
+    SDL_Renderer *renderer = NULL;
+
+    if (enable_visualization) {
+        if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+            fprintf(stderr, "SDL_Init Error: %s\n", SDL_GetError());
+            return 1;
+        }
     }
 
     if (sqlite3_open("dataset.db", &db) != SQLITE_OK) {
@@ -313,20 +319,22 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    SDL_Window *window = SDL_CreateWindow("Simulation", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                          WIDTH, HEIGHT, SDL_WINDOW_SHOWN);
-    if (!window) {
-        fprintf(stderr, "SDL_CreateWindow Error: %s\n", SDL_GetError());
-        sqlite3_close(db);
-        return 1;
-    }
+    if (enable_visualization) {
+        window = SDL_CreateWindow("Simulation", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                  WIDTH, HEIGHT, SDL_WINDOW_SHOWN);
+        if (!window) {
+            fprintf(stderr, "SDL_CreateWindow Error: %s\n", SDL_GetError());
+            sqlite3_close(db);
+            return 1;
+        }
 
-    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-    if (!renderer) {
-        fprintf(stderr, "SDL_CreateRenderer Error: %s\n", SDL_GetError());
-        SDL_DestroyWindow(window);
-        sqlite3_close(db);
-        return 1;
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+        if (!renderer) {
+            fprintf(stderr, "SDL_CreateRenderer Error: %s\n", SDL_GetError());
+            SDL_DestroyWindow(window);
+            sqlite3_close(db);
+            return 1;
+        }
     }
 
     init_particles();
@@ -335,15 +343,17 @@ int main(int argc, char *argv[]) {
     allocate_frame_buffers(total_frames);
 
     for (int frame = 0; frame < total_frames; frame++) {
-        SDL_Event event;
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) goto done;
-        }
+        if (enable_visualization) {
+            SDL_Event event;
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_QUIT) goto done;
+            }
 
-        draw_particles(renderer);
-        SDL_RenderPresent(renderer);
-        SDL_SetRenderDrawColor(renderer, 20, 20, 30, 255);
-        SDL_RenderClear(renderer);
+            draw_particles(renderer);
+            SDL_RenderPresent(renderer);
+            SDL_SetRenderDrawColor(renderer, 20, 20, 30, 255);
+            SDL_RenderClear(renderer);
+        }
 
         save_frame_to_buffer(frame);
 
@@ -358,9 +368,13 @@ done:
     free_frame_buffers(total_frames);
 
     sqlite3_close(db);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
+
+    if (enable_visualization) {
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+    }
 
     return 0;
 }
+
