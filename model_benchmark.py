@@ -2,12 +2,11 @@ import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
-import time
 import os
 
 WIDTH = 1200
 HEIGHT = 1000
-RADIUS = 14
+RADIUS = 24
 DIAMETER = RADIUS * 2
 
 FRAME_TIME = 0.016  # 16 ms per frame
@@ -83,39 +82,44 @@ def main():
     model.eval()
 
     input_size = model.net[0].in_features
-    NUM_PARTICLES = input_size // 2
+    NUM_PARTICLES = input_size // 4
 
-    positions = init_centered_particles(NUM_PARTICLES, RADIUS, WIDTH, HEIGHT)
-    norm_positions = normalize_positions(positions)
+    cur_positions = init_centered_particles(NUM_PARTICLES, RADIUS, WIDTH, HEIGHT)
+    prev_positions = cur_positions.copy()  # Für Frame 0 sind prev = cur
+
+    norm_cur = normalize_positions(cur_positions)
+    norm_prev = normalize_positions(prev_positions)
 
     plt.ion()
     fig, ax = plt.subplots(figsize=(8, 6))
-    scatter = ax.scatter(positions[:, 0], positions[:, 1], s=RADIUS*4, c='cyan', edgecolors='b')
+    scatter = ax.scatter(cur_positions[:, 0], cur_positions[:, 1], s=RADIUS*4, c='cyan', edgecolors='b')
     ax.set_xlim(0, WIDTH)
     ax.set_ylim(0, HEIGHT)
     ax.invert_yaxis()
     ax.set_aspect('equal')
 
     for frame in range(TOTAL_FRAMES):
-        input_data = norm_positions.flatten()
+        input_data = np.concatenate([norm_prev, norm_cur], axis=1).flatten()
         inp = torch.tensor(input_data, dtype=torch.float32, device=device).unsqueeze(0)
 
         with torch.no_grad():
             delta = model(inp).cpu().numpy().reshape(NUM_PARTICLES, 2)
 
-        norm_positions += delta
+        norm_prev = norm_cur.copy()
 
-        norm_positions = np.clip(norm_positions, [RADIUS/WIDTH, RADIUS/HEIGHT], [1 - RADIUS/WIDTH, 1 - RADIUS/HEIGHT])
+        norm_cur += delta
 
-        positions = denormalize_positions(norm_positions)
-        positions = clamp_positions(positions)
-        norm_positions = normalize_positions(positions)
+        norm_cur = np.clip(norm_cur, [RADIUS/WIDTH, RADIUS/HEIGHT], [1 - RADIUS/WIDTH, 1 - RADIUS/HEIGHT])
 
-        scatter.set_offsets(positions)
+        cur_positions = denormalize_positions(norm_cur)
+        cur_positions = clamp_positions(cur_positions)
+        norm_cur = normalize_positions(cur_positions)
+
+        scatter.set_offsets(cur_positions)
         ax.set_title(f"Frame {frame+1}/{TOTAL_FRAMES}")
         fig.canvas.draw()
         fig.canvas.flush_events()
-        # time.sleep(FRAME_TIME)  #! DEBUG DECOMMENT
+        # time.sleep(FRAME_TIME)  #! DEBUG UNCOMMENT LATER
 
     plt.ioff()
     plt.show()

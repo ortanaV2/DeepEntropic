@@ -11,7 +11,7 @@
 
 #define WIDTH 800
 #define HEIGHT 600
-#define RADIUS 14
+#define RADIUS 24
 #define NUM_PARTICLES 10
 #define PARTICLE_RADIUS (2.0f * RADIUS)
 #define DIAMETER (RADIUS * 2)
@@ -23,7 +23,7 @@
 #define FRAME_TIME 8
 #define RECORD_SECONDS 7
 
-bool use_gravity = true;
+bool use_gravity = false;
 bool use_boundaries = true;
 bool enable_visualization = false;
 
@@ -48,7 +48,7 @@ void allocate_frame_buffers(int total_frames) {
     all_inputs = malloc(sizeof(float*) * total_frames);
     all_targets = malloc(sizeof(float*) * total_frames);
     for (int i = 0; i < total_frames; i++) {
-        all_inputs[i] = malloc(NUM_PARTICLES * 2 * sizeof(float));
+        all_inputs[i] = malloc(NUM_PARTICLES * 4 * sizeof(float));
         all_targets[i] = malloc(NUM_PARTICLES * 2 * sizeof(float));
         if (!all_inputs[i] || !all_targets[i]) {
             fprintf(stderr, "Memory allocation failed for frame %d\n", i);
@@ -219,13 +219,12 @@ void draw_particles(SDL_Renderer *renderer) {
 }
 
 void save_frame_to_buffer(int frame) {
-    int num_floats = NUM_PARTICLES * 2;
     float *inputs = all_inputs[frame];
     float *targets = all_targets[frame];
 
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        inputs[i*2]   = particles[i].x / (float)WIDTH;
-        inputs[i*2+1] = particles[i].y / (float)HEIGHT;
+        inputs[i*4 + 0] = prev_positions[i][0];
+        inputs[i*4 + 1] = prev_positions[i][1];
     }
 
     compute_forces();
@@ -235,8 +234,11 @@ void save_frame_to_buffer(int frame) {
         float x_norm = particles[i].x / (float)WIDTH;
         float y_norm = particles[i].y / (float)HEIGHT;
 
-        targets[i*2]   = x_norm - prev_positions[i][0];
-        targets[i*2+1] = y_norm - prev_positions[i][1];
+        inputs[i*4 + 2] = x_norm;
+        inputs[i*4 + 3] = y_norm;
+
+        targets[i*2 + 0] = x_norm - prev_positions[i][0];
+        targets[i*2 + 1] = y_norm - prev_positions[i][1];
 
         prev_positions[i][0] = x_norm;
         prev_positions[i][1] = y_norm;
@@ -244,7 +246,7 @@ void save_frame_to_buffer(int frame) {
 }
 
 int write_all_frames_to_db(int total_frames) {
-    const char *sql = "INSERT INTO drop_10p_dataset (inputs, targets) VALUES (?, ?);";
+    const char *sql = "INSERT INTO space_10p_dataset (inputs, targets) VALUES (?, ?);";
     sqlite3_stmt *stmt;
     int rc;
 
@@ -265,7 +267,7 @@ int write_all_frames_to_db(int total_frames) {
         sqlite3_reset(stmt);
         sqlite3_clear_bindings(stmt);
 
-        sqlite3_bind_blob(stmt, 1, all_inputs[i], NUM_PARTICLES * 2 * sizeof(float), SQLITE_STATIC);
+        sqlite3_bind_blob(stmt, 1, all_inputs[i], NUM_PARTICLES * 4 * sizeof(float), SQLITE_STATIC);
         sqlite3_bind_blob(stmt, 2, all_targets[i], NUM_PARTICLES * 2 * sizeof(float), SQLITE_STATIC);
 
         rc = sqlite3_step(stmt);
@@ -307,7 +309,7 @@ int main(int argc, char *argv[]) {
     sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);  // enable parallel db-writing
 
     const char *sql_create = 
-        "CREATE TABLE IF NOT EXISTS drop_10p_dataset ("
+        "CREATE TABLE IF NOT EXISTS space_10p_dataset ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "inputs BLOB NOT NULL,"
         "targets BLOB NOT NULL);";

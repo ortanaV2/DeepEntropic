@@ -13,7 +13,7 @@ class FullRAMParticleDataset(Dataset):
         self.conn = sqlite3.connect(db_path)
         self.cursor = self.conn.cursor()
 
-        self.cursor.execute("SELECT COUNT(*) FROM drop_10p_dataset")
+        self.cursor.execute("SELECT COUNT(*) FROM space_10p_dataset")
         total_samples = self.cursor.fetchone()[0]
 
         if max_frames is not None and max_frames < total_samples:
@@ -21,18 +21,25 @@ class FullRAMParticleDataset(Dataset):
         else:
             self.total_samples = total_samples
 
-        self.features_per_particle = 4
+        self.input_features_per_particle = 4  # prev_x, prev_y, cur_x, cur_y
+        self.output_features_per_particle = 2  # dx, dy
 
-        query = f"SELECT inputs, targets FROM drop_10p_dataset LIMIT {self.total_samples}"
+        query = f"SELECT inputs, targets FROM space_10p_dataset LIMIT {self.total_samples}"
         rows = self.cursor.execute(query).fetchall()
 
         self.data = []
         for inputs_blob, targets_blob in rows:
             inputs = torch.frombuffer(inputs_blob, dtype=torch.float32)
             targets = torch.frombuffer(targets_blob, dtype=torch.float32)
-            self.data.append((inputs, targets))
 
-        self.num_particles = len(self.data[0][0]) // self.features_per_particle if self.data else 0
+            num_particles = inputs.shape[0] // 4
+            prev = inputs[:num_particles * 2]
+            cur = inputs[num_particles * 2:]
+
+            combined = torch.cat([prev, cur], dim=0)
+            self.data.append((combined, targets))
+
+        self.num_particles = len(self.data[0][0]) // self.input_features_per_particle if self.data else 0
 
     def __len__(self):
         return self.total_samples
@@ -69,14 +76,14 @@ def train(db_path, max_frames=None, hidden_size=512, epochs=50, batch_size=64, l
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    FEATURES_IN = dataset.features_per_particle
-    FEATURES_OUT = dataset.features_per_particle
+    FEATURES_IN = dataset.input_features_per_particle
+    FEATURES_OUT = dataset.output_features_per_particle
     NUM_PARTICLES = dataset.num_particles
 
     input_size = NUM_PARTICLES * FEATURES_IN
     output_size = NUM_PARTICLES * FEATURES_OUT
 
-    print(f"Detected: {NUM_PARTICLES*2} particles, {FEATURES_IN} input / {FEATURES_OUT} output features per particle")
+    print(f"Detected: {NUM_PARTICLES} particles, {FEATURES_IN} input / {FEATURES_OUT} output features per particle")
     print(f"Using {len(dataset)} samples (max_frames={max_frames}), split: {train_size} train / {val_size} val")
 
     model = ParticleNet(input_size, hidden_size, output_size).to(device)
