@@ -1,7 +1,6 @@
 <img width="1920" height="378" alt="Deep_Entropic_Logo_Crop" src="https://github.com/user-attachments/assets/03b1bbe7-c598-4407-9ad6-dd9fbf2882ba" />
 
-Registered Project for the Austrian Society for Artificial Intelligence (ASAI) Competition (BWKI):
-Accelerating Physical Simulations Using Neural Networks
+#### Registered Project for the Austrian Society for Artificial Intelligence (ASAI) Competition (BWKI): Accelerating Physical Simulations Using Neural Networks.
 
 This project explores the use of neural networks to significantly improve the speed and performance of physical simulations, particularly in Python and related environments.
 At its core, DeepEntropic is a hybrid simulation and machine learning framework for modeling and predicting the dynamics of interacting particles. It combines a high-performance C-based physics engine with structured data collection via SQLite and neural network training using PyTorch. The goal is to replace or accelerate traditional simulations by learning physical behaviors directly from data.
@@ -100,4 +99,4 @@ This will visualize the predicted particle trajectories using the trained model.
 
 ## License
 
-![MIT License](https://mit-license.org/)
+[MIT License](https://github.com/ortanaV2/DeepEntropic/blob/main/LICENSE)
