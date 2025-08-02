@@ -8,10 +8,11 @@
 #include <sqlite3.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <string.h>
 
 #define WIDTH 800
 #define HEIGHT 600
-#define RADIUS 24
+#define RADIUS 14
 #define NUM_PARTICLES 10
 #define PARTICLE_RADIUS (2.0f * RADIUS)
 #define DIAMETER (RADIUS * 2)
@@ -23,7 +24,7 @@
 #define FRAME_TIME 8
 #define RECORD_SECONDS 7
 
-bool use_gravity = false;
+bool use_gravity = true;
 bool use_boundaries = true;
 bool enable_visualization = false;
 
@@ -79,10 +80,13 @@ void init_particles() {
     const int max_attempts = 1000;
     const float min_dist = 2.5f * PARTICLE_RADIUS;
 
-    const float spawn_width = 240;
-    const float spawn_height = 120;
-    const float spawn_x_min = (WIDTH / 2.0f) - (spawn_width / 2.0f);
-    const float spawn_y_min = (HEIGHT / 2.0f) - (spawn_height / 2.0f);
+    const float margin = PARTICLE_RADIUS;
+    const float floor_clearance = 50.0f;
+
+    const float spawn_x_min = margin;
+    const float spawn_x_max = WIDTH - margin;
+    const float spawn_y_min = margin;
+    const float spawn_y_max = HEIGHT - margin - floor_clearance;
 
     for (int i = 0; i < NUM_PARTICLES; i++) {
         int attempts = 0;
@@ -90,8 +94,8 @@ void init_particles() {
 
         do {
             valid = true;
-            float x = spawn_x_min + (rand() % (int)spawn_width);
-            float y = spawn_y_min + (rand() % (int)spawn_height);
+            float x = spawn_x_min + ((float)rand() / RAND_MAX) * (spawn_x_max - spawn_x_min);
+            float y = spawn_y_min + ((float)rand() / RAND_MAX) * (spawn_y_max - spawn_y_min);
 
             for (int j = 0; j < i; j++) {
                 float dx = particles[j].x - x;
@@ -225,6 +229,8 @@ void save_frame_to_buffer(int frame) {
     for (int i = 0; i < NUM_PARTICLES; i++) {
         inputs[i*4 + 0] = prev_positions[i][0];
         inputs[i*4 + 1] = prev_positions[i][1];
+        inputs[i*4 + 2] = particles[i].vx / WIDTH;
+        inputs[i*4 + 3] = particles[i].vy / HEIGHT;
     }
 
     compute_forces();
@@ -234,9 +240,6 @@ void save_frame_to_buffer(int frame) {
         float x_norm = particles[i].x / (float)WIDTH;
         float y_norm = particles[i].y / (float)HEIGHT;
 
-        inputs[i*4 + 2] = x_norm;
-        inputs[i*4 + 3] = y_norm;
-
         targets[i*2 + 0] = x_norm - prev_positions[i][0];
         targets[i*2 + 1] = y_norm - prev_positions[i][1];
 
@@ -245,8 +248,10 @@ void save_frame_to_buffer(int frame) {
     }
 }
 
-int write_all_frames_to_db(int total_frames) {
-    const char *sql = "INSERT INTO space_10p_dataset (inputs, targets) VALUES (?, ?);";
+int write_all_frames_to_db(const char *table_name, int total_frames) {
+    char sql[256];
+    snprintf(sql, sizeof(sql), "INSERT INTO %s (inputs, targets) VALUES (?, ?);", table_name);
+
     sqlite3_stmt *stmt;
     int rc;
 
@@ -294,6 +299,12 @@ int main(int argc, char *argv[]) {
     SDL_Window *window = NULL;
     SDL_Renderer *renderer = NULL;
 
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <table_name>\n", argv[0]);
+        return 1;
+    }
+    const char *table_name = argv[1];
+
     if (enable_visualization) {
         if (SDL_Init(SDL_INIT_VIDEO) != 0) {
             fprintf(stderr, "SDL_Init Error: %s\n", SDL_GetError());
@@ -308,14 +319,16 @@ int main(int argc, char *argv[]) {
 
     sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);  // enable parallel db-writing
 
-    const char *sql_create = 
-        "CREATE TABLE IF NOT EXISTS space_10p_dataset ("
+    char sql_create[512];
+    snprintf(sql_create, sizeof(sql_create),
+        "CREATE TABLE IF NOT EXISTS %s ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "inputs BLOB NOT NULL,"
-        "targets BLOB NOT NULL);";
+        "targets BLOB NOT NULL);", table_name);
+
     char *err_msg = NULL;
     if (sqlite3_exec(db, sql_create, 0, 0, &err_msg) != SQLITE_OK) {
-        fprintf(stderr, "Failed to create table: %s\n", err_msg);
+        fprintf(stderr, "Failed to create table '%s': %s\n", table_name, err_msg);
         sqlite3_free(err_msg);
         sqlite3_close(db);
         return 1;
@@ -363,7 +376,7 @@ int main(int argc, char *argv[]) {
     }
 
 done:
-    if (write_all_frames_to_db(total_frames) != SQLITE_OK) {
+    if (write_all_frames_to_db(table_name, total_frames) != SQLITE_OK) {
         fprintf(stderr, "Error writing frames to database\n");
     }
 
@@ -379,4 +392,3 @@ done:
 
     return 0;
 }
-

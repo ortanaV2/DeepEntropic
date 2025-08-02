@@ -6,10 +6,10 @@ import os
 
 WIDTH = 1200
 HEIGHT = 1000
-RADIUS = 24
+RADIUS = 14
 DIAMETER = RADIUS * 2
 
-FRAME_TIME = 0.016  # 16 ms per frame
+FRAME_TIME = 0.016
 RECORD_SECONDS = 10
 TOTAL_FRAMES = int(RECORD_SECONDS / FRAME_TIME)
 
@@ -85,10 +85,9 @@ def main():
     NUM_PARTICLES = input_size // 4
 
     cur_positions = init_centered_particles(NUM_PARTICLES, RADIUS, WIDTH, HEIGHT)
-    prev_positions = cur_positions.copy()  # Für Frame 0 sind prev = cur
+    velocities = np.zeros_like(cur_positions)
 
     norm_cur = normalize_positions(cur_positions)
-    norm_prev = normalize_positions(prev_positions)
 
     plt.ion()
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -99,13 +98,15 @@ def main():
     ax.set_aspect('equal')
 
     for frame in range(TOTAL_FRAMES):
-        input_data = np.concatenate([norm_prev, norm_cur], axis=1).flatten()
+        norm_vel = velocities.copy()
+        norm_vel[:, 0] /= WIDTH
+        norm_vel[:, 1] /= HEIGHT
+
+        input_data = np.concatenate([norm_cur, norm_vel], axis=1).flatten()
         inp = torch.tensor(input_data, dtype=torch.float32, device=device).unsqueeze(0)
 
         with torch.no_grad():
             delta = model(inp).cpu().numpy().reshape(NUM_PARTICLES, 2)
-
-        norm_prev = norm_cur.copy()
 
         norm_cur += delta
 
@@ -113,13 +114,19 @@ def main():
 
         cur_positions = denormalize_positions(norm_cur)
         cur_positions = clamp_positions(cur_positions)
+
+        denorm_delta = delta.copy()
+        denorm_delta[:, 0] *= WIDTH
+        denorm_delta[:, 1] *= HEIGHT
+        velocities = denorm_delta / FRAME_TIME
+
         norm_cur = normalize_positions(cur_positions)
 
         scatter.set_offsets(cur_positions)
         ax.set_title(f"Frame {frame+1}/{TOTAL_FRAMES}")
         fig.canvas.draw()
         fig.canvas.flush_events()
-        # time.sleep(FRAME_TIME)  #! DEBUG UNCOMMENT LATER
+        # time.sleep(FRAME_TIME)  # Optional
 
     plt.ioff()
     plt.show()
