@@ -35,7 +35,7 @@ class SimpleGNN(MessagePassing):
         )
         # Edge message function operating on concatenated node embeddings
         self.edge_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.Linear(2 * hidden_dim + 3, hidden_dim),  # +3 = dist (1) + direction (2)
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
@@ -47,16 +47,21 @@ class SimpleGNN(MessagePassing):
         )
 
     def forward(self, x, edge_index):
-        # Initial node embedding
-        x = self.node_mlp(x)
-        # Message passing with aggregation
-        x = self.propagate(edge_index, x=x)
-        # Predict output deltas
-        return self.out_mlp(x)
+        # Apply node-level MLP to input features
+        x_in = self.node_mlp(x)
+        # Extract position from x
+        pos = x[:, :2]
+        # Propagate messages along the graph and aggregate at target nodes
+        x_out = self.propagate(edge_index, x=x_in, pos=pos)
+        # Residual connection + output MLP to predict final target (e.g. delta)
+        return self.out_mlp(x_out + x_in)
 
-    def message(self, x_i, x_j):
-        # Compose edge messages from source and target node embeddings
-        edge_input = torch.cat([x_i, x_j], dim=1)
+    def message(self, x_i, x_j, pos_i, pos_j):
+        rel_pos = pos_j - pos_i
+        dist = torch.norm(rel_pos, dim=1, keepdim=True)
+        direction = rel_pos / (dist + 1e-6)
+        # Concatenate source & target embeddings with geometric features
+        edge_input = torch.cat([x_i, x_j, dist, direction], dim=1)
         return self.edge_mlp(edge_input)
 
 def init_weights(m):

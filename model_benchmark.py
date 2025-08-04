@@ -8,11 +8,11 @@ from torch_geometric.nn import MessagePassing, radius_graph
 # Simulation parameters
 WIDTH, HEIGHT = 800, 600
 PARTICLE_RADIUS = 3
-NUM_PARTICLES = 2000
+NUM_PARTICLES = 1000
 HALF_PARTICLES = NUM_PARTICLES // 2
 GRAPH_RADIUS = 0.2
 FRAME_TIME = 0.016
-RECORD_SECONDS = 5
+RECORD_SECONDS = 12
 TOTAL_FRAMES = int(RECORD_SECONDS / FRAME_TIME)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -32,7 +32,7 @@ class SimpleGNN(MessagePassing):
         )
         # Edge message function
         self.edge_mlp = nn.Sequential(
-            nn.Linear(2 * HIDDEN_DIM, HIDDEN_DIM),
+            nn.Linear(2 * HIDDEN_DIM + 3, HIDDEN_DIM),  # +3 = dist (1) + direction (2)
             nn.ReLU(),
             nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
         )
@@ -44,15 +44,22 @@ class SimpleGNN(MessagePassing):
         )
 
     def forward(self, x, edge_index):
-        x = self.node_mlp(x)
-        x = self.propagate(edge_index, x=x)
-        return self.out_mlp(x)
+        # Apply node-level MLP to input features
+        x_in = self.node_mlp(x)
+        # Extract position from x
+        pos = x[:, :2]
+        # Propagate messages along the graph and aggregate at target nodes
+        x_out = self.propagate(edge_index, x=x_in, pos=pos)
+        # Residual connection + output MLP to predict final target (e.g. delta)
+        return self.out_mlp(x_out + x_in)
 
-    def message(self, x_i, x_j):
-        # Edge message input: concatenation of source and target node features
-        edge_input = torch.cat([x_i, x_j], dim=1)
+    def message(self, x_i, x_j, pos_i, pos_j):
+        rel_pos = pos_j - pos_i
+        dist = torch.norm(rel_pos, dim=1, keepdim=True)
+        direction = rel_pos / (dist + 1e-6)
+        # Concatenate source & target embeddings with geometric features
+        edge_input = torch.cat([x_i, x_j, dist, direction], dim=1)
         return self.edge_mlp(edge_input)
-
 
 # Particle Initialization in Two Spatially Separated Clusters
 def init_particles_from_clusters(num_particles=NUM_PARTICLES, cluster_radius=150, separation=400,
