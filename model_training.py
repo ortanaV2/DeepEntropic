@@ -12,9 +12,20 @@ import random
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Feature Configuration
+INPUT_FEATURE_NAMES = ["x", "y", "vx", "vy"]
+TARGET_FEATURE_NAMES = ["dx", "dy"]
+
+# Map feature names to column indices
+def build_feature_indices(feature_names):
+    return {name: i for i, name in enumerate(feature_names)}
+
+INPUT_FEATURE_IDX = build_feature_indices(INPUT_FEATURE_NAMES)
+TARGET_FEATURE_IDX = build_feature_indices(TARGET_FEATURE_NAMES)
+
 # Graph Neural Network Model Definition
 class SimpleGNN(MessagePassing):
-    def __init__(self, input_dim, hidden_dim):
+    def __init__(self, input_dim, hidden_dim, output_dim):
         super().__init__(aggr='mean')
         # Node feature embedding network
         self.node_mlp = nn.Sequential(
@@ -28,11 +39,11 @@ class SimpleGNN(MessagePassing):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
-        # Output MLP predicts position displacements (Δx, Δy)
+        # Output MLP predicts position displacements
         self.out_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 2)
+            nn.Linear(hidden_dim, output_dim)
         )
 
     def forward(self, x, edge_index):
@@ -48,16 +59,17 @@ class SimpleGNN(MessagePassing):
         edge_input = torch.cat([x_i, x_j], dim=1)
         return self.edge_mlp(edge_input)
 
-
 def init_weights(m):
     if isinstance(m, nn.Linear):
         nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
         if m.bias is not None:
             nn.init.zeros_(m.bias)
 
-
 # Load dataset from SQLite, convert blobs to PyG Data objects
-def load_sqlite_data(db_path, table_name, input_dim, radius, max_clip=1.0, limit=None):
+def load_sqlite_data(db_path, table_name, radius, max_clip=1.0, limit=None):
+    input_dim = len(INPUT_FEATURE_NAMES)
+    output_dim = len(TARGET_FEATURE_NAMES)
+
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     query = f"SELECT inputs, targets FROM {table_name}"
@@ -70,24 +82,22 @@ def load_sqlite_data(db_path, table_name, input_dim, radius, max_clip=1.0, limit
     dataset = []
     for inp_blob, tgt_blob in rows:
         inputs = np.frombuffer(inp_blob, dtype=np.float32).reshape(-1, input_dim)
-        targets = np.frombuffer(tgt_blob, dtype=np.float32).reshape(-1, 2)  # Δx, Δy
+        targets = np.frombuffer(tgt_blob, dtype=np.float32).reshape(-1, output_dim)
 
         # Clip inputs and targets to stabilize training
         inputs = np.clip(inputs, -max_clip, max_clip)
         targets = np.clip(targets, -max_clip, max_clip)
 
-        pos = torch.tensor(inputs[:, :2], dtype=torch.float32)
-        vel = torch.tensor(inputs[:, 2:], dtype=torch.float32)
-        x = torch.cat([pos, vel], dim=1)
+        x = torch.tensor(inputs, dtype=torch.float32)
         y = torch.tensor(targets, dtype=torch.float32)
 
-        # Construct radius graph edges based on position proximity
+        # Use first two features as position for graph construction
+        pos = torch.tensor(inputs[:, :2], dtype=torch.float32)
         edge_index = radius_graph(pos, r=radius, loop=False)
 
         dataset.append(Data(x=x, edge_index=edge_index, y=y))
 
     return dataset
-
 
 def evaluate(model, loader, loss_fn):
     model.eval()
@@ -100,13 +110,14 @@ def evaluate(model, loader, loss_fn):
             total_loss += loss.item()
     return total_loss / len(loader)
 
-
 def main(args):
+    input_dim = len(INPUT_FEATURE_NAMES)
+    output_dim = len(TARGET_FEATURE_NAMES)
+
     # Load dataset from SQLite
     dataset = load_sqlite_data(
         args.db_path,
         args.table_name,
-        input_dim=args.input_dim,
         radius=args.radius,
         max_clip=args.max_clip,
         limit=args.limit
@@ -120,7 +131,7 @@ def main(args):
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
 
     # Initialize model and optimizer
-    model = SimpleGNN(input_dim=args.input_dim, hidden_dim=args.hidden_dim).to(device)
+    model = SimpleGNN(input_dim=input_dim, hidden_dim=args.hidden_dim, output_dim=output_dim).to(device)
     model.apply(init_weights)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = nn.MSELoss()
@@ -157,7 +168,6 @@ def main(args):
             torch.save(model, args.save_model_path)
             print(f"Model saved at epoch {epoch+1} with val loss {val_loss:.8f}")
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train GNN on particle position data from SQLite")
 
@@ -165,8 +175,6 @@ if __name__ == "__main__":
                         help="SQLite database path")
     parser.add_argument("--table_name", type=str, default="cosmic_2000p_6f_orion",
                         help="SQLite table name containing inputs and targets blobs")
-    parser.add_argument("--input_dim", type=int, default=4,
-                        help="Dimension of input features per node (e.g. pos_x, pos_y, vel_x, vel_y)")
     parser.add_argument("--hidden_dim", type=int, default=128,
                         help="Hidden layer size for MLPs")
     parser.add_argument("--radius", type=float, default=0.1,
