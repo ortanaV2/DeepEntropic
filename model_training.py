@@ -13,8 +13,8 @@ import random
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Feature Configuration
-INPUT_FEATURE_NAMES = ["x", "y", "vx", "vy"]
-TARGET_FEATURE_NAMES = ["dx", "dy"]
+INPUT_FEATURE_NAMES = ["x", "y", "vx", "vy", "CF"]
+TARGET_FEATURE_NAMES = ["dx", "dy", "vx", "vy"]
 
 # Map feature names to column indices
 def build_feature_indices(feature_names):

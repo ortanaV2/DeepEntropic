@@ -36,6 +36,7 @@ typedef struct {
     float vx, vy;
     float fx, fy;
     Uint8 r, g, b;
+    bool collision_flag;  // neu: Kollisionsflag pro Partikel
 } Particle;
 
 Particle particles[NUM_PARTICLES];
@@ -54,8 +55,8 @@ void allocate_frame_buffers(int total_frames) {
     all_inputs = malloc(sizeof(float*) * total_frames);
     all_targets = malloc(sizeof(float*) * total_frames);
     for (int i = 0; i < total_frames; i++) {
-        all_inputs[i] = malloc(NUM_PARTICLES * 4 * sizeof(float));
-        all_targets[i] = malloc(NUM_PARTICLES * 2 * sizeof(float));
+        all_inputs[i] = malloc(NUM_PARTICLES * 5 * sizeof(float));   // 5 Inputs: x,y,vx,vy,collision_flag
+        all_targets[i] = malloc(NUM_PARTICLES * 4 * sizeof(float));  // 4 Targets: dx,dy,vx,vy
         if (!all_inputs[i] || !all_targets[i]) {
             fprintf(stderr, "Memory allocation failed for frame %d\n", i);
             exit(1);
@@ -118,7 +119,7 @@ void init_particles() {
             y = cy1 + sinf(angle) * radius;
         } while (!is_position_valid(0, i, x, y) && ++attempts < max_attempts);
 
-        particles[i] = (Particle){ x, y, 0, 0, 0, 0, 50, 100 + rand() % 156, 200 + rand() % 55 };
+        particles[i] = (Particle){ x, y, 0, 0, 0, 0, 50, 100 + rand() % 156, 200 + rand() % 55, false };
         prev_positions[i][0] = x / (float)WIDTH;
         prev_positions[i][1] = y / (float)HEIGHT;
     }
@@ -134,7 +135,7 @@ void init_particles() {
             y = cy2 + sinf(angle) * radius;
         } while (!is_position_valid(HALF_PARTICLES, i, x, y) && ++attempts < max_attempts);
 
-        particles[i] = (Particle){ x, y, 0, 0, 0, 0, 200 + rand() % 55, 50, 50 + rand() % 100 };
+        particles[i] = (Particle){ x, y, 0, 0, 0, 0, 200 + rand() % 55, 50, 50 + rand() % 100, false };
         prev_positions[i][0] = x / (float)WIDTH;
         prev_positions[i][1] = y / (float)HEIGHT;
     }
@@ -152,10 +153,13 @@ void draw_filled_circle(SDL_Renderer *renderer, int cx, int cy, int radius) {
 
 // Calculates pairwise interactions between particles:
 // gravitational attraction + pressure and viscosity (short-range collision handling)
+// -> setzt auch collision_flag für beteiligte Partikel
 void compute_forces() {
     #pragma omp parallel for
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        particles[i].fx = particles[i].fy = 0;
+        particles[i].fx = 0;
+        particles[i].fy = 0;
+        particles[i].collision_flag = false; // Reset collision flag vor neuer Berechnung
     }
 
     #pragma omp parallel for schedule(dynamic)
@@ -212,6 +216,10 @@ void compute_forces() {
                     particles[j].vx -= viscx;
                     #pragma omp atomic
                     particles[j].vy -= viscy;
+
+                    // Setze collision_flag bei Kollision für beide Partikel
+                    particles[i].collision_flag = true;
+                    particles[j].collision_flag = true;
                 }
             }
         }
@@ -249,23 +257,26 @@ void save_frame_to_buffer(int frame) {
     float *inputs = all_inputs[frame];
     float *targets = all_targets[frame];
 
+    // Inputs: x, y, vx, vy, collision_flag (normalized pos & raw velocity + flag)
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        inputs[i*4 + 0] = prev_positions[i][0];
-        inputs[i*4 + 1] = prev_positions[i][1];
-        inputs[i*4 + 2] = particles[i].x / (float)WIDTH;
-        inputs[i*4 + 3] = particles[i].y / (float)HEIGHT;
+        inputs[i*5 + 0] = particles[i].x / (float)WIDTH;
+        inputs[i*5 + 1] = particles[i].y / (float)HEIGHT;
+        inputs[i*5 + 2] = particles[i].vx;
+        inputs[i*5 + 3] = particles[i].vy;
+        inputs[i*5 + 4] = particles[i].collision_flag ? 1.0f : 0.0f;
     }
 
     compute_forces();
     update_particles();
 
+    // Targets: delta-x, delta-y, vx, vy (positions delta + velocity)
     for (int i = 0; i < NUM_PARTICLES; i++) {
         float x_norm = particles[i].x / (float)WIDTH;
         float y_norm = particles[i].y / (float)HEIGHT;
-        targets[i*2 + 0] = x_norm - prev_positions[i][0];
-        targets[i*2 + 1] = y_norm - prev_positions[i][1];
-        prev_positions[i][0] = x_norm;
-        prev_positions[i][1] = y_norm;
+        targets[i*4 + 0] = x_norm - inputs[i*5 + 0];
+        targets[i*4 + 1] = y_norm - inputs[i*5 + 1];
+        targets[i*4 + 2] = particles[i].vx;
+        targets[i*4 + 3] = particles[i].vy;
     }
 }
 
@@ -288,8 +299,8 @@ int write_all_frames_to_db(const char *table_name, int total_frames) {
         sqlite3_reset(stmt);
         sqlite3_clear_bindings(stmt);
 
-        sqlite3_bind_blob(stmt, 1, all_inputs[i], NUM_PARTICLES * 4 * sizeof(float), SQLITE_STATIC);
-        sqlite3_bind_blob(stmt, 2, all_targets[i], NUM_PARTICLES * 2 * sizeof(float), SQLITE_STATIC);
+        sqlite3_bind_blob(stmt, 1, all_inputs[i], NUM_PARTICLES * 5 * sizeof(float), SQLITE_STATIC);
+        sqlite3_bind_blob(stmt, 2, all_targets[i], NUM_PARTICLES * 4 * sizeof(float), SQLITE_STATIC);
 
         rc = sqlite3_step(stmt);
         if (rc != SQLITE_DONE) {
