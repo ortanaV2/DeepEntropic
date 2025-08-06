@@ -19,6 +19,7 @@ jobs:
         sudo apt update
         sudo apt install -y gcc libsdl2-dev libsqlite3-dev python3 python3-pip
         pip3 install torch  # install independently to resolve build conflict issue
+        pip3 install torch-cluster torch-geometric -f https://data.pyg.org/whl/torch-2.5.1+cpu.html
         pip3 install -r requirements.txt || true
 
     - name: Compile Simulation
