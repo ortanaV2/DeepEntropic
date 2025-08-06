@@ -33,4 +33,4 @@ jobs:
       run: python3 model_training.py --table_name smoke_test --epochs 1 --limit 10
 
     - name: Run Benchmark Script
-      run: python3 benchmark.py
+      run: python3 model_benchmark.py
