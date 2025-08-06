@@ -25,7 +25,7 @@ jobs:
         gcc -fopenmp simulation.c -o simulation `sdl2-config --cflags --libs` -lsqlite3 -O2 -lm
 
     - name: Run Simulation and Generate Dataset
-      run: ./simulation --table smoke_test
+      run: ./simulation smoke_test
 
     - name: Run Python Training Script
       run: python3 model_training.py --table_name smoke_test --epochs 1 --limit 10
