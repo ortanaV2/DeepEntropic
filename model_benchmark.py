@@ -1,19 +1,12 @@
-# Modified benchmark code for your specified input/output features
-# INPUT_FEATURE_NAMES = ["x", "y", "vx", "vy", "CF"]
-# TARGET_FEATURE_NAMES = ["dx", "dy", "vx", "vy"]
-
 import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
-from torch_geometric.data import Data
-from torch_geometric.nn import MessagePassing, radius_graph
 
-# Constants and Simulation Settings
+# Constants
 WIDTH, HEIGHT = 800, 600
 PARTICLE_RADIUS = 3
 NUM_PARTICLES = 1000
-GRAPH_RADIUS = 0.2
 FRAME_TIME = 0.016
 RECORD_SECONDS = 12
 TOTAL_FRAMES = int(RECORD_SECONDS / FRAME_TIME)
@@ -24,38 +17,22 @@ INPUT_DIM = 5  # x, y, vx, vy, CF
 HIDDEN_DIM = 128
 OUTPUT_DIM = 4  # dx, dy, vx, vy
 
-class SimpleGNN(MessagePassing):
+# Simple MLP Model (replaces the GNN)
+class SimpleMLP(nn.Module):
     def __init__(self):
-        super().__init__(aggr='mean')
-        self.node_mlp = nn.Sequential(
+        super().__init__()
+        self.net = nn.Sequential(
             nn.Linear(INPUT_DIM, HIDDEN_DIM),
             nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
-        )
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(2 * HIDDEN_DIM + 3, HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
-        )
-        self.out_mlp = nn.Sequential(
             nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
             nn.ReLU(),
             nn.Linear(HIDDEN_DIM, OUTPUT_DIM)
         )
 
-    def forward(self, x, edge_index):
-        x_in = self.node_mlp(x)
-        pos = x[:, :2]
-        x_out = self.propagate(edge_index, x=x_in, pos=pos)
-        return self.out_mlp(x_out + x_in)
+    def forward(self, x):
+        return self.net(x)
 
-    def message(self, x_i, x_j, pos_i, pos_j):
-        rel_pos = pos_j - pos_i
-        dist = torch.norm(rel_pos, dim=1, keepdim=True)
-        direction = rel_pos / (dist + 1e-6)
-        edge_input = torch.cat([x_i, x_j, dist, direction], dim=1)
-        return self.edge_mlp(edge_input)
-
+# Initial particle setup (unchanged)
 def init_particles_from_clusters(num_particles=NUM_PARTICLES, cluster_radius=150, separation=400):
     half = num_particles // 2
     min_dist = 2.0 * PARTICLE_RADIUS
@@ -97,26 +74,27 @@ def init_particles_from_clusters(num_particles=NUM_PARTICLES, cluster_radius=150
 
     return positions, velocities
 
+# Normalization helpers
 def normalize_positions(pos): return np.stack([pos[:, 0] / WIDTH, pos[:, 1] / HEIGHT], axis=1)
 def denormalize_positions(norm): return np.stack([norm[:, 0] * WIDTH, norm[:, 1] * HEIGHT], axis=1)
 
-def build_graph(pos, vel, collision_flags):
+# Prepare input tensor for MLP
+def build_input_tensor(pos, vel, collision_flags):
     norm_pos = normalize_positions(pos)
-    x = np.concatenate([norm_pos, vel, collision_flags[:, None]], axis=1)
+    x = np.concatenate([norm_pos, vel, collision_flags[:, None]], axis=1)  # shape: (N, 5)
     x_tensor = torch.tensor(x, dtype=torch.float32, device=device)
-    edge_index = radius_graph(torch.tensor(norm_pos, dtype=torch.float32, device=device), r=GRAPH_RADIUS, loop=False)
-    return Data(x=x_tensor, edge_index=edge_index)
+    return x_tensor
 
+# Main simulation
 def main():
-    model = SimpleGNN().to(device)
-    model.load_state_dict(torch.load("best_gnn_model.pt", map_location=device))
+    model = SimpleMLP().to(device)
+    model.load_state_dict(torch.load("best_mlp_model.pt", map_location=device))
     model.eval()
 
     cur_pos, cur_vel = init_particles_from_clusters()
-    prev_pos = cur_pos - (cur_vel * FRAME_TIME)
-
     collision_flags = np.zeros((NUM_PARTICLES,), dtype=np.float32)
 
+    # Visualization setup
     plt.ion()
     fig, ax = plt.subplots(figsize=(8, 6))
     scatter = ax.scatter(cur_pos[:, 0], cur_pos[:, 1], s=PARTICLE_RADIUS * 4, c='cyan', edgecolors='b')
@@ -126,9 +104,9 @@ def main():
     ax.set_aspect('equal')
 
     for frame in range(TOTAL_FRAMES):
-        graph = build_graph(cur_pos, cur_vel, collision_flags).to(device)
+        x_tensor = build_input_tensor(cur_pos, cur_vel, collision_flags)
         with torch.no_grad():
-            out = model(graph.x, graph.edge_index).cpu().numpy()
+            out = model(x_tensor).cpu().numpy()
 
         delta_pos = out[:, :2]
         cur_vel = out[:, 2:]

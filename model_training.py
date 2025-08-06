@@ -4,11 +4,9 @@ import torch.nn as nn
 import torch.optim as optim
 import sqlite3
 import numpy as np
-from torch_geometric.data import Data
-from torch_geometric.nn import MessagePassing, radius_graph
-from torch_geometric.loader import DataLoader
-from tqdm import tqdm
 import random
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -16,53 +14,26 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 INPUT_FEATURE_NAMES = ["x", "y", "vx", "vy", "CF"]
 TARGET_FEATURE_NAMES = ["dx", "dy", "vx", "vy"]
 
-# Map feature names to column indices
 def build_feature_indices(feature_names):
     return {name: i for i, name in enumerate(feature_names)}
 
 INPUT_FEATURE_IDX = build_feature_indices(INPUT_FEATURE_NAMES)
 TARGET_FEATURE_IDX = build_feature_indices(TARGET_FEATURE_NAMES)
 
-# Graph Neural Network Model Definition
-class SimpleGNN(MessagePassing):
+# MLP Model Definition
+class SimpleMLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
-        super().__init__(aggr='mean')
-        # Node feature embedding network
-        self.node_mlp = nn.Sequential(
+        super().__init__()
+        self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        # Edge message function operating on concatenated node embeddings
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_dim + 3, hidden_dim),  # +3 = dist (1) + direction (2)
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        # Output MLP predicts position displacements
-        self.out_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, output_dim)
         )
 
-    def forward(self, x, edge_index):
-        # Apply node-level MLP to input features
-        x_in = self.node_mlp(x)
-        # Extract position from x
-        pos = x[:, :2]
-        # Propagate messages along the graph and aggregate at target nodes
-        x_out = self.propagate(edge_index, x=x_in, pos=pos)
-        # Residual connection + output MLP to predict final target (e.g. delta)
-        return self.out_mlp(x_out + x_in)
-
-    def message(self, x_i, x_j, pos_i, pos_j):
-        rel_pos = pos_j - pos_i
-        dist = torch.norm(rel_pos, dim=1, keepdim=True)
-        direction = rel_pos / (dist + 1e-6)
-        # Concatenate source & target embeddings with geometric features
-        edge_input = torch.cat([x_i, x_j, dist, direction], dim=1)
-        return self.edge_mlp(edge_input)
+    def forward(self, x):
+        return self.net(x)
 
 def init_weights(m):
     if isinstance(m, nn.Linear):
@@ -70,8 +41,8 @@ def init_weights(m):
         if m.bias is not None:
             nn.init.zeros_(m.bias)
 
-# Load dataset from SQLite, convert blobs to PyG Data objects
-def load_sqlite_data(db_path, table_name, radius, max_clip=1.0, limit=None):
+# Load SQLite dataset
+def load_sqlite_flat(db_path, table_name, max_clip=1.0, limit=None):
     input_dim = len(INPUT_FEATURE_NAMES)
     output_dim = len(TARGET_FEATURE_NAMES)
 
@@ -84,34 +55,33 @@ def load_sqlite_data(db_path, table_name, radius, max_clip=1.0, limit=None):
     rows = cursor.fetchall()
     conn.close()
 
-    dataset = []
+    x_list, y_list = [], []
+
     for inp_blob, tgt_blob in rows:
         inputs = np.frombuffer(inp_blob, dtype=np.float32).reshape(-1, input_dim)
         targets = np.frombuffer(tgt_blob, dtype=np.float32).reshape(-1, output_dim)
 
-        # Clip inputs and targets to stabilize training
+        # Clip to stabilize training
         inputs = np.clip(inputs, -max_clip, max_clip)
         targets = np.clip(targets, -max_clip, max_clip)
 
-        x = torch.tensor(inputs, dtype=torch.float32)
-        y = torch.tensor(targets, dtype=torch.float32)
+        x_list.append(inputs)
+        y_list.append(targets)
 
-        # Use first two features as position for graph construction
-        pos = torch.tensor(inputs[:, :2], dtype=torch.float32)
-        edge_index = radius_graph(pos, r=radius, loop=False)
+    x_all = torch.tensor(np.concatenate(x_list, axis=0), dtype=torch.float32)
+    y_all = torch.tensor(np.concatenate(y_list, axis=0), dtype=torch.float32)
 
-        dataset.append(Data(x=x, edge_index=edge_index, y=y))
+    return TensorDataset(x_all, y_all)
 
-    return dataset
-
+# Evaluation
 def evaluate(model, loader, loss_fn):
     model.eval()
     total_loss = 0.0
     with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            pred = model(batch.x, batch.edge_index)
-            loss = loss_fn(pred, batch.y)
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x)
+            loss = loss_fn(pred, y)
             total_loss += loss.item()
     return total_loss / len(loader)
 
@@ -119,24 +89,24 @@ def main(args):
     input_dim = len(INPUT_FEATURE_NAMES)
     output_dim = len(TARGET_FEATURE_NAMES)
 
-    # Load dataset from SQLite
-    dataset = load_sqlite_data(
-        args.db_path,
-        args.table_name,
-        radius=args.radius,
-        max_clip=args.max_clip,
-        limit=args.limit
-    )
-    random.shuffle(dataset)
-    split_idx = int(len(dataset) * (1 - args.val_split))
-    train_dataset = dataset[:split_idx]
-    val_dataset = dataset[split_idx:]
+    # Load dataset
+    dataset = load_sqlite_flat(args.db_path, args.table_name, max_clip=args.max_clip, limit=args.limit)
+    data_size = len(dataset)
+    indices = list(range(data_size))
+    random.shuffle(indices)
+
+    split_idx = int(data_size * (1 - args.val_split))
+    train_indices = indices[:split_idx]
+    val_indices = indices[split_idx:]
+
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(dataset, val_indices)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
 
-    # Initialize model and optimizer
-    model = SimpleGNN(input_dim=input_dim, hidden_dim=args.hidden_dim, output_dim=output_dim).to(device)
+    # Model, Optimizer, Loss
+    model = SimpleMLP(input_dim=input_dim, hidden_dim=args.hidden_dim, output_dim=output_dim).to(device)
     model.apply(init_weights)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = nn.MSELoss()
@@ -146,14 +116,14 @@ def main(args):
     for epoch in range(args.epochs):
         model.train()
         total_loss = 0.0
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
-            batch = batch.to(device)
+
+        for x, y in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
+            x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
 
-            pred = model(batch.x, batch.edge_index)
-            loss = loss_fn(pred, batch.y)
+            pred = model(x)
+            loss = loss_fn(pred, y)
 
-            # Skip batches with invalid loss values
             if torch.isnan(loss) or torch.isinf(loss):
                 print("NaN or Inf loss detected, skipping batch")
                 continue
@@ -161,6 +131,7 @@ def main(args):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
+
             total_loss += loss.item()
 
         val_loss = evaluate(model, val_loader, loss_fn)
@@ -174,34 +145,20 @@ def main(args):
             print(f"Model saved at epoch {epoch+1} with val loss {val_loss:.8f}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train GNN on particle position data from SQLite")
+    parser = argparse.ArgumentParser(description="Train MLP on particle data from SQLite")
 
-    parser.add_argument("--db_path", type=str, default="dataset.db",
-                        help="SQLite database path")
-    parser.add_argument("--table_name", type=str, default="cosmic_2000p_6f_orion",
-                        help="SQLite table name containing inputs and targets blobs")
-    parser.add_argument("--hidden_dim", type=int, default=128,
-                        help="Hidden layer size for MLPs")
-    parser.add_argument("--radius", type=float, default=0.1,
-                        help="Radius for graph edge construction")
-    parser.add_argument("--batch_size", type=int, default=32,
-                        help="Batch size for training")
-    parser.add_argument("--epochs", type=int, default=10,
-                        help="Number of training epochs")
-    parser.add_argument("--val_split", type=float, default=0.1,
-                        help="Fraction of data used for validation")
-    parser.add_argument("--grad_clip", type=float, default=1.0,
-                        help="Gradient clipping norm threshold")
-    parser.add_argument("--lr", type=float, default=1e-3,
-                        help="Learning rate for optimizer")
-    parser.add_argument("--max_clip", type=float, default=1.0,
-                        help="Clipping threshold for inputs and targets")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Limit number of rows loaded from database")
-    parser.add_argument("--save_state_path", type=str, default="best_gnn_model.pt",
-                        help="Path to save model state dict")
-    parser.add_argument("--save_model_path", type=str, default="full_gnn_model.pt",
-                        help="Path to save full model")
+    parser.add_argument("--db_path", type=str, default="dataset.db")
+    parser.add_argument("--table_name", type=str, default="standard")
+    parser.add_argument("--hidden_dim", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--val_split", type=float, default=0.1)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--max_clip", type=float, default=1.0)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--save_state_path", type=str, default="best_mlp_model.pt")
+    parser.add_argument("--save_model_path", type=str, default="full_mlp_model.pt")
 
     args = parser.parse_args()
     main(args)
