@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
 
 # Constants
 WIDTH, HEIGHT = 800, 600
@@ -13,7 +14,7 @@ TOTAL_FRAMES = int(RECORD_SECONDS / FRAME_TIME)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-INPUT_DIM = 5  # x, y, vx, vy, CF
+INPUT_DIM = 5  # x, y, vx, vy, nnd (normalized distance to nearest neighbor)
 HIDDEN_DIM = 128
 OUTPUT_DIM = 4  # dx, dy, vx, vy
 
@@ -24,15 +25,16 @@ class SimpleMLP(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(INPUT_DIM, HIDDEN_DIM),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(HIDDEN_DIM, OUTPUT_DIM)
         )
 
     def forward(self, x):
         return self.net(x)
 
-# Initial particle setup (unchanged)
 def init_particles_from_clusters(num_particles=NUM_PARTICLES, cluster_radius=150, separation=400):
     half = num_particles // 2
     min_dist = 2.0 * PARTICLE_RADIUS
@@ -70,7 +72,7 @@ def init_particles_from_clusters(num_particles=NUM_PARTICLES, cluster_radius=150
                 attempts += 1
             if attempts == max_attempts:
                 positions[start_idx + i] = [cx, cy]
-                velocities[start_idx + i] = [0.0, cluster["vy"]]
+                velocities[start_idx + i] = np.random.uniform(-0.5, 0.5, size=2)  # init vel
 
     return positions, velocities
 
@@ -78,12 +80,19 @@ def init_particles_from_clusters(num_particles=NUM_PARTICLES, cluster_radius=150
 def normalize_positions(pos): return np.stack([pos[:, 0] / WIDTH, pos[:, 1] / HEIGHT], axis=1)
 def denormalize_positions(norm): return np.stack([norm[:, 0] * WIDTH, norm[:, 1] * HEIGHT], axis=1)
 
+# Calculate normalized distance to nearest neighbor
+def compute_normalized_nn_distances(positions):
+    tree = cKDTree(positions)
+    dists, _ = tree.query(positions, k=2)  # k=2 because 1st nearest is the point itself
+    nearest_dists = dists[:, 1]  # second column: nearest other point
+    return nearest_dists / WIDTH  # Normalize to [0, 1] by WIDTH (same as im Training)
+
 # Prepare input tensor for MLP
-def build_input_tensor(pos, vel, collision_flags):
+def build_input_tensor(pos, vel):
     norm_pos = normalize_positions(pos)
-    x = np.concatenate([norm_pos, vel, collision_flags[:, None]], axis=1)  # shape: (N, 5)
-    x_tensor = torch.tensor(x, dtype=torch.float32, device=device)
-    return x_tensor
+    cf_norm = compute_normalized_nn_distances(pos)
+    x = np.concatenate([norm_pos, vel, cf_norm[:, None]], axis=1)
+    return torch.tensor(x, dtype=torch.float32, device=device)
 
 # Main simulation
 def main():
@@ -92,7 +101,6 @@ def main():
     model.eval()
 
     cur_pos, cur_vel = init_particles_from_clusters()
-    collision_flags = np.zeros((NUM_PARTICLES,), dtype=np.float32)
 
     # Visualization setup
     plt.ion()
@@ -104,7 +112,7 @@ def main():
     ax.set_aspect('equal')
 
     for frame in range(TOTAL_FRAMES):
-        x_tensor = build_input_tensor(cur_pos, cur_vel, collision_flags)
+        x_tensor = build_input_tensor(cur_pos, cur_vel)
         with torch.no_grad():
             out = model(x_tensor).cpu().numpy()
 

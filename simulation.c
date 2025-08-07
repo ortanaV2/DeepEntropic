@@ -257,13 +257,25 @@ void save_frame_to_buffer(int frame) {
     float *inputs = all_inputs[frame];
     float *targets = all_targets[frame];
 
-    // Inputs: x, y, vx, vy, collision_flag (normalized pos & raw velocity + flag)
+    // Inputs: x, y, vx, vy, nearest_distance (normalized pos & raw velocity & dist)
     for (int i = 0; i < NUM_PARTICLES; i++) {
+        float min_dist_sq = 1e9f;
+        for (int j = 0; j < NUM_PARTICLES; j++) {
+            if (i == j) continue;
+            float dx = particles[j].x - particles[i].x;
+            float dy = particles[j].y - particles[i].y;
+            float dist_sq = dx * dx + dy * dy;
+            if (dist_sq < min_dist_sq) {
+                min_dist_sq = dist_sq;
+            }
+        }
+        float nearest_dist = sqrtf(min_dist_sq);
+
         inputs[i*5 + 0] = particles[i].x / (float)WIDTH;
         inputs[i*5 + 1] = particles[i].y / (float)HEIGHT;
         inputs[i*5 + 2] = particles[i].vx;
         inputs[i*5 + 3] = particles[i].vy;
-        inputs[i*5 + 4] = particles[i].collision_flag ? 1.0f : 0.0f;
+        inputs[i*5 + 4] = nearest_dist / (float)WIDTH;
     }
 
     compute_forces();

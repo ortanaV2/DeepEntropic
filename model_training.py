@@ -11,7 +11,7 @@ from tqdm import tqdm
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Feature Configuration
-INPUT_FEATURE_NAMES = ["x", "y", "vx", "vy", "CF"]
+INPUT_FEATURE_NAMES = ["x", "y", "vx", "vy", "nnd"]
 TARGET_FEATURE_NAMES = ["dx", "dy", "vx", "vy"]
 
 def build_feature_indices(feature_names):
@@ -27,8 +27,10 @@ class SimpleMLP(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, output_dim)
         )
 
@@ -151,10 +153,10 @@ if __name__ == "__main__":
     parser.add_argument("--table_name", type=str, default="standard")
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--val_split", type=float, default=0.1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max_clip", type=float, default=1.0)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--save_state_path", type=str, default="best_mlp_model.pt")
