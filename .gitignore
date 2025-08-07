@@ -3,4 +3,6 @@ dataset.db-wal
 
 *.pt
 
+*.exe
+
 .vscode/
