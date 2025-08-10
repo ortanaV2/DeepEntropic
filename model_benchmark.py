@@ -1,154 +1,298 @@
-# Modified benchmark code for your specified input/output features
-# INPUT_FEATURE_NAMES = ["x", "y", "vx", "vy", "CF"]
-# TARGET_FEATURE_NAMES = ["dx", "dy", "vx", "vy"]
-
+import argparse
+import time
+import numpy as np
+from scipy.spatial import cKDTree
 import torch
 import torch.nn as nn
-import numpy as np
-import matplotlib.pyplot as plt
-from torch_geometric.data import Data
-from torch_geometric.nn import MessagePassing, radius_graph
 
-# Constants and Simulation Settings
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
 WIDTH, HEIGHT = 800, 600
 PARTICLE_RADIUS = 3
 NUM_PARTICLES = 1000
-GRAPH_RADIUS = 0.2
 FRAME_TIME = 0.016
-RECORD_SECONDS = 12
+RECORD_SECONDS = 60
 TOTAL_FRAMES = int(RECORD_SECONDS / FRAME_TIME)
+
+INPUT_DIM = 18   # x,y,vx,vy + 3 * (dx,dy,dvx,dvy) + gx, gy
+HIDDEN_DIM = 128
+OUTPUT_DIM = 4   # dx, dy, dvx, dvy
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-INPUT_DIM = 5  # x, y, vx, vy, CF
-HIDDEN_DIM = 128
-OUTPUT_DIM = 4  # dx, dy, vx, vy
-
-class SimpleGNN(MessagePassing):
-    def __init__(self):
-        super().__init__(aggr='mean')
-        self.node_mlp = nn.Sequential(
-            nn.Linear(INPUT_DIM, HIDDEN_DIM),
+class SimpleMLP(nn.Module):
+    def __init__(self, input_dim=INPUT_DIM, hidden_dim=HIDDEN_DIM, output_dim=OUTPUT_DIM, dropout=0.05):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
-        )
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(2 * HIDDEN_DIM + 3, HIDDEN_DIM),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
-        )
-        self.out_mlp = nn.Sequential(
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, OUTPUT_DIM)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim)
         )
 
-    def forward(self, x, edge_index):
-        x_in = self.node_mlp(x)
-        pos = x[:, :2]
-        x_out = self.propagate(edge_index, x=x_in, pos=pos)
-        return self.out_mlp(x_out + x_in)
+    def forward(self, x):
+        return self.net(x)
 
-    def message(self, x_i, x_j, pos_i, pos_j):
-        rel_pos = pos_j - pos_i
-        dist = torch.norm(rel_pos, dim=1, keepdim=True)
-        direction = rel_pos / (dist + 1e-6)
-        edge_input = torch.cat([x_i, x_j, dist, direction], dim=1)
-        return self.edge_mlp(edge_input)
+def init_particles_from_clusters(num_particles=NUM_PARTICLES, cluster_radius=150, separation=400, rng=None):
+    if rng is None:
+        rng = np.random.default_rng()
 
-def init_particles_from_clusters(num_particles=NUM_PARTICLES, cluster_radius=150, separation=400):
     half = num_particles // 2
-    min_dist = 2.0 * PARTICLE_RADIUS
-    clusters = [
-        {"cx": WIDTH / 2 - separation / 2, "cy": HEIGHT / 2, "vy": 0, "start": 0, "end": half},
-        {"cx": WIDTH / 2 + separation / 2, "cy": HEIGHT / 2, "vy": 0, "start": half, "end": num_particles}
-    ]
     positions = np.zeros((num_particles, 2), dtype=np.float32)
     velocities = np.zeros((num_particles, 2), dtype=np.float32)
 
-    def is_valid(start_idx, end_idx, x, y):
-        for j in range(start_idx, end_idx):
-            dx = positions[j, 0] - x
-            dy = positions[j, 1] - y
-            if dx * dx + dy * dy < min_dist * min_dist:
-                return False
-        return True
+    min_dist = 2.0 * PARTICLE_RADIUS
+    min_dist_sq = min_dist * min_dist
 
-    max_attempts = 3000
-    for cluster in clusters:
-        count = cluster["end"] - cluster["start"]
-        cx, cy = cluster["cx"], cluster["cy"]
-        start_idx = cluster["start"]
-        for i in range(count):
+    initial_speed = 0
+
+    def fill_cluster(start_idx, count, cx, cy):
+        placed = 0
+        attempts = 0
+        max_attempts = 3000
+        while placed < count:
+            angle = rng.uniform(0.0, 2.0 * np.pi)
+            r = np.sqrt(rng.uniform(0.0, 1.0)) * cluster_radius
+            x = cx + np.cos(angle) * r
+            y = cy + np.sin(angle) * r
+
+            # Check distance only against already placed particles in this cluster
+            if placed > 0:
+                dx = positions[start_idx:start_idx + placed, 0] - x
+                dy = positions[start_idx:start_idx + placed, 1] - y
+                if np.any(dx * dx + dy * dy < min_dist_sq):
+                    attempts += 1
+                    if attempts > count * max_attempts:
+                        # fallback for stuck placement
+                        remaining = count - placed
+                        positions[start_idx + placed:start_idx + count, 0] = cx + rng.uniform(-1, 1, size=remaining)
+                        positions[start_idx + placed:start_idx + count, 1] = cy + rng.uniform(-1, 1, size=remaining)
+                        velocities[start_idx + placed:start_idx + count] = rng.uniform(-initial_speed, initial_speed, size=(remaining, 2))
+                        break
+                    continue
+
+            positions[start_idx + placed] = (x, y)
+            velocities[start_idx + placed] = rng.uniform(-initial_speed, initial_speed, size=2)
+            placed += 1
             attempts = 0
-            while attempts < max_attempts:
-                angle = np.random.uniform(0, 2 * np.pi)
-                r = np.sqrt(np.random.uniform(0, 1)) * cluster_radius
-                x = cx + np.cos(angle) * r
-                y = cy + np.sin(angle) * r
-                if is_valid(start_idx, start_idx + i, x, y):
-                    positions[start_idx + i] = [x, y]
-                    velocities[start_idx + i] = [0.0, cluster["vy"]]
-                    break
-                attempts += 1
-            if attempts == max_attempts:
-                positions[start_idx + i] = [cx, cy]
-                velocities[start_idx + i] = [0.0, cluster["vy"]]
+
+    cx1 = WIDTH / 2.0 - separation / 2.0
+    cx2 = WIDTH / 2.0 + separation / 2.0
+    cy = HEIGHT / 2.0
+
+    fill_cluster(0, half, cx1, cy)
+    fill_cluster(half, num_particles - half, cx2, cy)
 
     return positions, velocities
 
-def normalize_positions(pos): return np.stack([pos[:, 0] / WIDTH, pos[:, 1] / HEIGHT], axis=1)
-def denormalize_positions(norm): return np.stack([norm[:, 0] * WIDTH, norm[:, 1] * HEIGHT], axis=1)
+def build_input_numpy(positions, velocities):
+    """
+    Build input features including normalized particle states,
+    nearest neighbor deltas and global gravity (gx, gy).
+    """
+    N = positions.shape[0]
 
-def build_graph(pos, vel, collision_flags):
-    norm_pos = normalize_positions(pos)
-    x = np.concatenate([norm_pos, vel, collision_flags[:, None]], axis=1)
-    x_tensor = torch.tensor(x, dtype=torch.float32, device=device)
-    edge_index = radius_graph(torch.tensor(norm_pos, dtype=torch.float32, device=device), r=GRAPH_RADIUS, loop=False)
-    return Data(x=x_tensor, edge_index=edge_index)
+    # Normalize particle positions and velocities
+    x_norm = (positions[:, 0] / WIDTH).astype(np.float32)
+    y_norm = (positions[:, 1] / HEIGHT).astype(np.float32)
+    vx_norm = (velocities[:, 0] / WIDTH).astype(np.float32)
+    vy_norm = (velocities[:, 1] / HEIGHT).astype(np.float32)
 
-def main():
-    model = SimpleGNN().to(device)
-    model.load_state_dict(torch.load("best_gnn_model.pt", map_location=device))
+    # Find 3 nearest neighbors per particle
+    tree = cKDTree(positions)
+    _, idxs = tree.query(positions, k=4, workers=-1)
+    nbr_idx = idxs[:, 1:4]
+
+    nbr_pos = positions[nbr_idx]
+    nbr_vel = velocities[nbr_idx]
+
+    pos_exp = positions[:, None, :]
+    vel_exp = velocities[:, None, :]
+
+    rel_pos = nbr_pos - pos_exp
+    rel_vel = nbr_vel - vel_exp
+
+    rel_pos[..., 0] /= WIDTH
+    rel_pos[..., 1] /= HEIGHT
+    rel_vel[..., 0] /= WIDTH
+    rel_vel[..., 1] /= HEIGHT
+
+    # Global gravity (fixed constants, normalized by screen size for scale)
+    gx = 0.0
+    gy = 0.1  # example gravity downward
+
+    out = np.empty((N, INPUT_DIM), dtype=np.float32)
+    out[:, 0:4] = np.column_stack([x_norm, y_norm, vx_norm, vy_norm])
+
+    base = 4
+    for i in range(3):
+        out[:, base + i*4 : base + i*4 + 4] = np.column_stack([
+            rel_pos[:, i, 0], rel_pos[:, i, 1],
+            rel_vel[:, i, 0], rel_vel[:, i, 1]
+        ])
+
+    # Append global gravity features for each particle
+    out[:, -2] = gx
+    out[:, -1] = gy
+
+    return out
+
+def run_benchmark(args):
+    model = SimpleMLP(input_dim=INPUT_DIM, hidden_dim=args.hidden_dim, output_dim=OUTPUT_DIM, dropout=0.05)
+    ckpt = torch.load(args.model_path, map_location=device)
+
+    if isinstance(ckpt, dict) and set(ckpt.keys()).issubset(set(model.state_dict().keys())):
+        model.load_state_dict(ckpt)
+    elif isinstance(ckpt, dict) and 'state_dict' in ckpt:
+        model.load_state_dict(ckpt['state_dict'])
+    else:
+        try:
+            model = ckpt
+        except Exception:
+            model.load_state_dict(ckpt)
+
+    model.to(device)
     model.eval()
 
-    cur_pos, cur_vel = init_particles_from_clusters()
-    prev_pos = cur_pos - (cur_vel * FRAME_TIME)
+    runner = model
+    if args.use_jit:
+        try:
+            runner = torch.jit.script(model.eval()).to(device)
+            print("Using TorchScript compiled model for inference.")
+        except Exception as e:
+            print("TorchScript compilation failed, using eager model. Error:", e)
 
-    collision_flags = np.zeros((NUM_PARTICLES,), dtype=np.float32)
+    rng = np.random.default_rng(seed=args.seed)
+    positions, velocities = init_particles_from_clusters(
+        num_particles=args.num_particles,
+        cluster_radius=args.cluster_radius,
+        separation=args.separation,
+        rng=rng
+    )
 
-    plt.ion()
-    fig, ax = plt.subplots(figsize=(8, 6))
-    scatter = ax.scatter(cur_pos[:, 0], cur_pos[:, 1], s=PARTICLE_RADIUS * 4, c='cyan', edgecolors='b')
-    ax.set_xlim(0, WIDTH)
-    ax.set_ylim(0, HEIGHT)
-    ax.invert_yaxis()
-    ax.set_aspect('equal')
+    num = positions.shape[0]
 
-    for frame in range(TOTAL_FRAMES):
-        graph = build_graph(cur_pos, cur_vel, collision_flags).to(device)
+    do_vis = args.visualize and (plt is not None)
+    if do_vis:
+        plt.ion()
+        fig, ax = plt.subplots(figsize=(8, 6))
+        scatter = ax.scatter(positions[:, 0], positions[:, 1], s=PARTICLE_RADIUS * 4, c='cyan', edgecolors='b')
+        ax.set_xlim(0, WIDTH)
+        ax.set_ylim(0, HEIGHT)
+        ax.invert_yaxis()
+        ax.set_aspect('equal')
+
+    t_total_start = time.time()
+    frame_times = []
+
+    for frame in range(args.total_frames):
+        t0 = time.time()
+
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("Positions contain NaN oder Inf")
+        if not np.all(np.isfinite(velocities)):
+            raise ValueError("Velocities contain NaN oder Inf")
+
+        x_np = build_input_numpy(positions, velocities)
+
         with torch.no_grad():
-            out = model(graph.x, graph.edge_index).cpu().numpy()
+            x_tensor = torch.from_numpy(x_np).to(device)
+            out = runner(x_tensor)
+            out_np = out.cpu().numpy()
 
-        delta_pos = out[:, :2]
-        cur_vel = out[:, 2:]
+        # Update normalized positions with predicted dx, dy
+        max_dv = 0.1
+        out_np[:, 2] = np.clip(out_np[:, 2], -max_dv, max_dv)
+        out_np[:, 3] = np.clip(out_np[:, 3], -max_dv, max_dv)
 
-        norm_cur = normalize_positions(cur_pos)
-        norm_cur += delta_pos
-        norm_cur = np.clip(norm_cur,
-                           [PARTICLE_RADIUS / WIDTH, PARTICLE_RADIUS / HEIGHT],
-                           [1 - PARTICLE_RADIUS / WIDTH, 1 - PARTICLE_RADIUS / HEIGHT])
-        cur_pos = denormalize_positions(norm_cur)
-        cur_pos[:, 0] = np.clip(cur_pos[:, 0], PARTICLE_RADIUS, WIDTH - PARTICLE_RADIUS)
-        cur_pos[:, 1] = np.clip(cur_pos[:, 1], PARTICLE_RADIUS, HEIGHT - PARTICLE_RADIUS)
+        norm_pos = np.empty((num, 2), dtype=np.float32)
+        norm_pos[:, 0] = positions[:, 0] / WIDTH
+        norm_pos[:, 1] = positions[:, 1] / HEIGHT
 
-        scatter.set_offsets(cur_pos)
-        ax.set_title(f"Frame {frame + 1}/{TOTAL_FRAMES}")
-        fig.canvas.draw()
-        fig.canvas.flush_events()
+        norm_pos[:, 0] += out_np[:, 0]
+        norm_pos[:, 1] += out_np[:, 1]
 
-    plt.ioff()
-    plt.show()
+        eps_x = PARTICLE_RADIUS / WIDTH
+        eps_y = PARTICLE_RADIUS / HEIGHT
+        np.clip(norm_pos[:, 0], eps_x, 1.0 - eps_x, out=norm_pos[:, 0])
+        np.clip(norm_pos[:, 1], eps_y, 1.0 - eps_y, out=norm_pos[:, 1])
+
+        # Compute denormalized positions and velocities (using predicted dvx, dvy)
+        new_positions_x = norm_pos[:, 0] * WIDTH
+        new_positions_y = norm_pos[:, 1] * HEIGHT
+
+        # Velocity updates from predicted dvx, dvy instead of finite difference
+        velocities[:, 0] += out_np[:, 2] * WIDTH
+        velocities[:, 1] += out_np[:, 3] * HEIGHT
+
+        positions[:, 0] = new_positions_x
+        positions[:, 1] = new_positions_y
+
+        if args.use_boundaries:
+            mask_left = positions[:, 0] < PARTICLE_RADIUS
+            mask_right = positions[:, 0] > (WIDTH - PARTICLE_RADIUS)
+            mask_top = positions[:, 1] < PARTICLE_RADIUS
+            mask_bottom = positions[:, 1] > (HEIGHT - PARTICLE_RADIUS)
+
+            if mask_left.any():
+                positions[mask_left, 0] = PARTICLE_RADIUS
+                velocities[mask_left, 0] *= -args.boundary_damping
+            if mask_right.any():
+                positions[mask_right, 0] = WIDTH - PARTICLE_RADIUS
+                velocities[mask_right, 0] *= -args.boundary_damping
+            if mask_top.any():
+                positions[mask_top, 1] = PARTICLE_RADIUS
+                velocities[mask_top, 1] *= -args.boundary_damping
+            if mask_bottom.any():
+                positions[mask_bottom, 1] = HEIGHT - PARTICLE_RADIUS
+                velocities[mask_bottom, 1] *= -args.boundary_damping
+
+        frame_times.append(time.time() - t0)
+
+        if do_vis and (frame % args.vis_every == 0):
+            scatter.set_offsets(positions)
+            ax.set_title(f"Frame {frame + 1}/{args.total_frames} | avg frame time {np.mean(frame_times[-50:]):.4f}s")
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+            plt.pause(0.001)
+
+    total_time = time.time() - t_total_start
+    avg_frame_time = np.mean(frame_times) if frame_times else 0.0
+    fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0.0
+
+    print("Benchmark finished.")
+    print(f"Total frames: {args.total_frames}, Total time: {total_time:.4f}s")
+    print(f"Avg frame time: {avg_frame_time:.6f}s, Approx FPS: {fps:.2f}")
+
+    if do_vis:
+        plt.ioff()
+        plt.show(block=True)
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Optimized particle inference benchmark with gravity feature.")
+    p.add_argument("--model_path", type=str, default="best_mlp_model.pt", help="Path to saved model")
+    p.add_argument("--num_particles", type=int, default=NUM_PARTICLES)
+    p.add_argument("--total_frames", type=int, default=TOTAL_FRAMES)
+    p.add_argument("--hidden_dim", type=int, default=HIDDEN_DIM)
+    p.add_argument("--use_jit", action="store_true", help="Use TorchScript compilation for faster inference")
+    p.add_argument("--visualize", type=int, default=0, help="Enable visualization (0/1)")
+    p.add_argument("--vis_every", type=int, default=1, help="Update visualization every N frames")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--cluster_radius", type=float, default=150.0)
+    p.add_argument("--separation", type=float, default=400.0)
+    p.add_argument("--use_boundaries", type=int, default=1, help="Apply boundary bouncing")
+    p.add_argument("--boundary_damping", type=float, default=0.2)
+    args = p.parse_args()
+    args.visualize = bool(args.visualize)
+    args.use_boundaries = bool(args.use_boundaries)
+    return args
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    run_benchmark(args)

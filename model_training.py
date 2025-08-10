@@ -4,65 +4,46 @@ import torch.nn as nn
 import torch.optim as optim
 import sqlite3
 import numpy as np
-from torch_geometric.data import Data
-from torch_geometric.nn import MessagePassing, radius_graph
-from torch_geometric.loader import DataLoader
-from tqdm import tqdm
 import random
+import os
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Feature Configuration
-INPUT_FEATURE_NAMES = ["x", "y", "vx", "vy", "CF"]
-TARGET_FEATURE_NAMES = ["dx", "dy", "vx", "vy"]
+# Input layout: particle state + 3 nearest neighbor deltas + global force
+INPUT_FEATURE_NAMES = [
+    "x", "y", "vx", "vy",
+    "n1_dx", "n1_dy", "n1_dvx", "n1_dvy",
+    "n2_dx", "n2_dy", "n2_dvx", "n2_dvy",
+    "n3_dx", "n3_dy", "n3_dvx", "n3_dvy",
+    "gx", "gy"
+]
 
-# Map feature names to column indices
+# Physics simulation outputs: position and velocity changes
+TARGET_FEATURE_NAMES = ["dx", "dy", "dvx", "dvy"]
+
 def build_feature_indices(feature_names):
     return {name: i for i, name in enumerate(feature_names)}
 
 INPUT_FEATURE_IDX = build_feature_indices(INPUT_FEATURE_NAMES)
 TARGET_FEATURE_IDX = build_feature_indices(TARGET_FEATURE_NAMES)
 
-# Graph Neural Network Model Definition
-class SimpleGNN(MessagePassing):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super().__init__(aggr='mean')
-        # Node feature embedding network
-        self.node_mlp = nn.Sequential(
+class SimpleMLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.05):
+        super().__init__()
+        self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        # Edge message function operating on concatenated node embeddings
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_dim + 3, hidden_dim),  # +3 = dist (1) + direction (2)
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        # Output MLP predicts position displacements
-        self.out_mlp = nn.Sequential(
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, output_dim)
         )
 
-    def forward(self, x, edge_index):
-        # Apply node-level MLP to input features
-        x_in = self.node_mlp(x)
-        # Extract position from x
-        pos = x[:, :2]
-        # Propagate messages along the graph and aggregate at target nodes
-        x_out = self.propagate(edge_index, x=x_in, pos=pos)
-        # Residual connection + output MLP to predict final target (e.g. delta)
-        return self.out_mlp(x_out + x_in)
-
-    def message(self, x_i, x_j, pos_i, pos_j):
-        rel_pos = pos_j - pos_i
-        dist = torch.norm(rel_pos, dim=1, keepdim=True)
-        direction = rel_pos / (dist + 1e-6)
-        # Concatenate source & target embeddings with geometric features
-        edge_input = torch.cat([x_i, x_j, dist, direction], dim=1)
-        return self.edge_mlp(edge_input)
+    def forward(self, x):
+        return self.net(x)
 
 def init_weights(m):
     if isinstance(m, nn.Linear):
@@ -70,138 +51,206 @@ def init_weights(m):
         if m.bias is not None:
             nn.init.zeros_(m.bias)
 
-# Load dataset from SQLite, convert blobs to PyG Data objects
-def load_sqlite_data(db_path, table_name, radius, max_clip=1.0, limit=None):
+def load_sqlite_flat(db_path, table_name, max_clip=1.0, limit=None):
+    """
+    Loads random frames from SQLite, concatenating all particles into one dataset.
+    Each frame contains particle states as 'inputs' and physics updates as 'targets'.
+    """
     input_dim = len(INPUT_FEATURE_NAMES)
     output_dim = len(TARGET_FEATURE_NAMES)
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    query = f"SELECT inputs, targets FROM {table_name}"
-    if limit is not None:
-        query += f" LIMIT {limit}"
-    cursor.execute(query)
-    rows = cursor.fetchall()
+
+    # Sample random frames if limit specified
+    cursor.execute(f"SELECT rowid FROM {table_name}")
+    all_rowids = [row[0] for row in cursor.fetchall()]
     conn.close()
 
-    dataset = []
-    for inp_blob, tgt_blob in rows:
-        inputs = np.frombuffer(inp_blob, dtype=np.float32).reshape(-1, input_dim)
-        targets = np.frombuffer(tgt_blob, dtype=np.float32).reshape(-1, output_dim)
+    if limit is not None and limit < len(all_rowids):
+        selected_rowids = random.sample(all_rowids, limit)
+    else:
+        selected_rowids = all_rowids
 
-        # Clip inputs and targets to stabilize training
+    x_list, y_list = [], []
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # Load and reshape particle data from selected frames
+    for idx, rowid in enumerate(selected_rowids):
+        cursor.execute(f"SELECT inputs, targets FROM {table_name} WHERE rowid = ?", (rowid,))
+        row = cursor.fetchone()
+        if row is None:
+            continue
+        inp_blob, tgt_blob = row
+
+        inputs = np.frombuffer(inp_blob, dtype=np.float32)
+        if inputs.size % input_dim != 0:
+            raise ValueError(f"Inputs blob in row {rowid} not divisible by input_dim ({input_dim}). Got {inputs.size} floats.")
+        inputs = inputs.reshape(-1, input_dim)
+
+        full_targets = np.frombuffer(tgt_blob, dtype=np.float32)
+        if full_targets.size % inputs.shape[0] != 0:
+            raise ValueError(f"Targets blob in row {rowid} incompatible with inputs rows: targets size {full_targets.size}, inputs rows {inputs.shape[0]}.")
+        full_output_dim = full_targets.size // inputs.shape[0]
+        full_targets = full_targets.reshape(-1, full_output_dim)
+
+        if full_output_dim < output_dim:
+            raise ValueError(f"Row {rowid} targets have fewer dims ({full_output_dim}) than expected ({output_dim}).")
+        targets = full_targets[:, :output_dim]
+
+        # Clip extreme values for training stability
         inputs = np.clip(inputs, -max_clip, max_clip)
         targets = np.clip(targets, -max_clip, max_clip)
 
-        x = torch.tensor(inputs, dtype=torch.float32)
-        y = torch.tensor(targets, dtype=torch.float32)
+        x_list.append(inputs)
+        y_list.append(targets)
 
-        # Use first two features as position for graph construction
-        pos = torch.tensor(inputs[:, :2], dtype=torch.float32)
-        edge_index = radius_graph(pos, r=radius, loop=False)
+    conn.close()
 
-        dataset.append(Data(x=x, edge_index=edge_index, y=y))
+    if len(x_list) == 0:
+        raise ValueError("No data loaded from database.")
 
-    return dataset
+    x_all = torch.tensor(np.concatenate(x_list, axis=0), dtype=torch.float32)
+    y_all = torch.tensor(np.concatenate(y_list, axis=0), dtype=torch.float32)
+
+    return TensorDataset(x_all, y_all)
 
 def evaluate(model, loader, loss_fn):
     model.eval()
     total_loss = 0.0
+    n_batches = 0
     with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            pred = model(batch.x, batch.edge_index)
-            loss = loss_fn(pred, batch.y)
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x)
+            loss = loss_fn(pred, y)
             total_loss += loss.item()
-    return total_loss / len(loader)
+            n_batches += 1
+    return total_loss / max(1, n_batches)
 
 def main(args):
     input_dim = len(INPUT_FEATURE_NAMES)
     output_dim = len(TARGET_FEATURE_NAMES)
 
-    # Load dataset from SQLite
-    dataset = load_sqlite_data(
-        args.db_path,
-        args.table_name,
-        radius=args.radius,
-        max_clip=args.max_clip,
-        limit=args.limit
-    )
-    random.shuffle(dataset)
-    split_idx = int(len(dataset) * (1 - args.val_split))
-    train_dataset = dataset[:split_idx]
-    val_dataset = dataset[split_idx:]
+    print("Loading dataset...")
+    dataset = load_sqlite_flat(args.db_path, args.table_name, max_clip=args.max_clip, limit=args.limit)
+    data_size = len(dataset)
+    print(f"Total samples (particles across frames): {data_size}")
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
+    # Train/validation split
+    indices = list(range(data_size))
+    random.shuffle(indices)
 
-    # Initialize model and optimizer
-    model = SimpleGNN(input_dim=input_dim, hidden_dim=args.hidden_dim, output_dim=output_dim).to(device)
+    split_idx = int(data_size * (1 - args.val_split))
+    train_indices = indices[:split_idx]
+    val_indices = indices[split_idx:]
+
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(dataset, val_indices)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, pin_memory=args.pin_memory)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=args.pin_memory)
+
+    model = SimpleMLP(input_dim=input_dim, hidden_dim=args.hidden_dim, output_dim=output_dim, dropout=args.dropout).to(device)
     model.apply(init_weights)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_fn = nn.MSELoss()
 
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+
     best_val_loss = float('inf')
+    epochs_no_improve = 0
+
+    use_amp = args.use_amp and torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     for epoch in range(args.epochs):
         model.train()
         total_loss = 0.0
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
-            batch = batch.to(device)
+        n_batches = 0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
+        for x, y in pbar:
+            x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
 
-            pred = model(batch.x, batch.edge_index)
-            loss = loss_fn(pred, batch.y)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                pred = model(x)
+                loss = loss_fn(pred, y)
 
-            # Skip batches with invalid loss values
+            # Skip corrupted batches
             if torch.isnan(loss) or torch.isinf(loss):
                 print("NaN or Inf loss detected, skipping batch")
                 continue
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+
             total_loss += loss.item()
+            n_batches += 1
+            pbar.set_postfix(train_loss=total_loss / max(1, n_batches))
 
         val_loss = evaluate(model, val_loader, loss_fn)
+        print(f"Epoch {epoch+1} | Train Loss: {total_loss / max(1, n_batches):.8f} | Val Loss: {val_loss:.8f}")
 
-        print(f"Train Loss: {total_loss / len(train_loader):.8f} | Val Loss: {val_loss:.8f}")
+        scheduler.step(val_loss)
 
-        if val_loss < best_val_loss:
+        # Save best model based on validation loss
+        if val_loss < best_val_loss - 1e-12:
             best_val_loss = val_loss
+            epochs_no_improve = 0
+
+            os.makedirs(os.path.dirname(args.save_state_path) or ".", exist_ok=True)
             torch.save(model.state_dict(), args.save_state_path)
+            print(f"Model state_dict saved with val loss {val_loss:.8f}")
+
             torch.save(model, args.save_model_path)
-            print(f"Model saved at epoch {epoch+1} with val loss {val_loss:.8f}")
+            print(f"Full model saved to {args.save_model_path}")
+        else:
+            epochs_no_improve += 1
+
+        if epochs_no_improve >= args.early_stop_patience:
+            print(f"No improvement for {epochs_no_improve} epochs. Early stopping.")
+            break
+
+    print("Training finished. Best val loss:", best_val_loss)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train GNN on particle position data from SQLite")
+    parser = argparse.ArgumentParser(description="Train MLP on particle data from SQLite")
 
-    parser.add_argument("--db_path", type=str, default="dataset.db",
-                        help="SQLite database path")
-    parser.add_argument("--table_name", type=str, default="cosmic_2000p_6f_orion",
-                        help="SQLite table name containing inputs and targets blobs")
-    parser.add_argument("--hidden_dim", type=int, default=128,
-                        help="Hidden layer size for MLPs")
-    parser.add_argument("--radius", type=float, default=0.1,
-                        help="Radius for graph edge construction")
-    parser.add_argument("--batch_size", type=int, default=32,
-                        help="Batch size for training")
-    parser.add_argument("--epochs", type=int, default=10,
-                        help="Number of training epochs")
-    parser.add_argument("--val_split", type=float, default=0.1,
-                        help="Fraction of data used for validation")
-    parser.add_argument("--grad_clip", type=float, default=1.0,
-                        help="Gradient clipping norm threshold")
-    parser.add_argument("--lr", type=float, default=1e-3,
-                        help="Learning rate for optimizer")
-    parser.add_argument("--max_clip", type=float, default=1.0,
-                        help="Clipping threshold for inputs and targets")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Limit number of rows loaded from database")
-    parser.add_argument("--save_state_path", type=str, default="best_gnn_model.pt",
-                        help="Path to save model state dict")
-    parser.add_argument("--save_model_path", type=str, default="full_gnn_model.pt",
-                        help="Path to save full model")
+    parser.add_argument("--db_path", type=str, default="dataset.db")
+    parser.add_argument("--table_name", type=str, default="standard")
+    parser.add_argument("--hidden_dim", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--val_split", type=float, default=0.2)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--max_clip", type=float, default=1.0)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--save_state_path", type=str, default="best_mlp_model.pt")
+    parser.add_argument("--save_model_path", type=str, default="full_mlp_model.pt")
+
+    parser.add_argument("--dropout", type=float, default=0.05)
+    parser.add_argument("--weight_decay", type=float, default=1e-6)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--pin_memory", type=bool, default=True)
+    parser.add_argument("--use_amp", type=bool, default=True, help="Use mixed precision (if CUDA available)")
+    parser.add_argument("--early_stop_patience", type=int, default=7)
+    parser.add_argument("--save_every_n_epochs", type=int, default=0, help="If >0 save checkpoint every N epochs")
 
     args = parser.parse_args()
     main(args)
