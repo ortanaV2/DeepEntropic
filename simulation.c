@@ -1,3 +1,4 @@
+// simulation_fixed.c
 #include <SDL2/SDL.h>
 #include <math.h>
 #include <stdio.h>
@@ -26,37 +27,46 @@
 #define FRAME_TIME 8
 #define RECORD_SECONDS 10
 
+// Movement detection parameters for early stopping
+#define VELOCITY_THRESHOLD 0.1f  // speed threshold for considering particles as stopped
+#define STOP_RATIO 0.85f         // fraction of particles that must be stopped to end recording
+
+static const float PI_F = 3.14159265358979323846f;
+
 bool use_gravity = true;
 bool use_boundaries = true;
 bool enable_visualization = true;
 
-// Core particle structure including forces and color attributes
 typedef struct {
     float x, y;
     float vx, vy;
     float fx, fy;
     Uint8 r, g, b;
-    bool collision_flag;  // neu: Kollisionsflag pro Partikel
 } Particle;
 
 Particle particles[NUM_PARTICLES];
-float prev_positions[NUM_PARTICLES][2];  // previous normalized positions for delta target generation
+float prev_positions[NUM_PARTICLES][2];
 
 sqlite3 *db = NULL;
 
 #define MAX_FRAMES ((RECORD_SECONDS * 1000) / FRAME_TIME)
 
-// Buffers to store simulation inputs/targets for ML dataset creation
 float **all_inputs = NULL;
 float **all_targets = NULL;
 
-// Allocate 2D buffers for inputs and targets per frame
+void compute_forces();
+void update_particles();
+
 void allocate_frame_buffers(int total_frames) {
     all_inputs = malloc(sizeof(float*) * total_frames);
     all_targets = malloc(sizeof(float*) * total_frames);
+    if (!all_inputs || !all_targets) {
+        fprintf(stderr, "Memory allocation failed for frame pointers\n");
+        exit(1);
+    }
     for (int i = 0; i < total_frames; i++) {
-        all_inputs[i] = malloc(NUM_PARTICLES * 5 * sizeof(float));   // 5 Inputs: x,y,vx,vy,collision_flag
-        all_targets[i] = malloc(NUM_PARTICLES * 4 * sizeof(float));  // 4 Targets: dx,dy,vx,vy
+        all_inputs[i] = malloc(NUM_PARTICLES * 18 * sizeof(float));  // 18 features: particle state + 3 neighbors + gravity
+        all_targets[i] = malloc(NUM_PARTICLES * 6 * sizeof(float));  // 6 targets: dx, dy, dvx, dvy, vx, vy
         if (!all_inputs[i] || !all_targets[i]) {
             fprintf(stderr, "Memory allocation failed for frame %d\n", i);
             exit(1);
@@ -64,17 +74,18 @@ void allocate_frame_buffers(int total_frames) {
     }
 }
 
-// Cleanup for dataset buffers
 void free_frame_buffers(int total_frames) {
+    if (!all_inputs || !all_targets) return;
     for (int i = 0; i < total_frames; i++) {
         free(all_inputs[i]);
         free(all_targets[i]);
     }
     free(all_inputs);
     free(all_targets);
+    all_inputs = NULL;
+    all_targets = NULL;
 }
 
-// Initialize a random seed that avoids collisions across multiple processes
 void init_random_seed() {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -82,23 +93,26 @@ void init_random_seed() {
     srand(seed);
 }
 
-// Place particles into two well-separated circular clusters ("planets").
-// Randomized position generation with minimal inter-particle distance enforcement.
+static bool is_position_valid_range(int cluster_start, int cluster_end, float x, float y, float min_dist_sq) {
+    for (int j = cluster_start; j < cluster_end; j++) {
+        float dx = particles[j].x - x;
+        float dy = particles[j].y - y;
+        if (dx*dx + dy*dy < min_dist_sq) return false;
+    }
+    return true;
+}
+
 void init_particles() {
     init_random_seed();
 
-    const float cluster_radius = 150.0f;
-    const float separation = 400.0f;
     const float min_dist = 2.0f * PARTICLE_RADIUS;
-
-    const float cx1 = WIDTH / 2.0f - separation / 2.0f;
-    const float cx2 = WIDTH / 2.0f + separation / 2.0f;
-    const float cy1 = HEIGHT / 2.0f;
-    const float cy2 = HEIGHT / 2.0f;
-
     const int max_attempts = 3000;
 
-    // Ensures particles are not too close within a cluster
+    int num_planets = 2 + rand() % 4; 
+
+    int base_particles = NUM_PARTICLES / num_planets;
+    int remainder = NUM_PARTICLES % num_planets;
+
     bool is_position_valid(int cluster_start, int cluster_end, float x, float y) {
         for (int j = cluster_start; j < cluster_end; j++) {
             float dx = particles[j].x - x;
@@ -108,58 +122,58 @@ void init_particles() {
         return true;
     }
 
-    // First (left) cluster
-    for (int i = 0; i < HALF_PARTICLES; i++) {
-        int attempts = 0;
-        float x, y;
-        do {
-            float angle = ((float)rand() / RAND_MAX) * 2.0f * M_PI;
-            float radius = sqrtf((float)rand() / RAND_MAX) * cluster_radius;
-            x = cx1 + cosf(angle) * radius;
-            y = cy1 + sinf(angle) * radius;
-        } while (!is_position_valid(0, i, x, y) && ++attempts < max_attempts);
+    int particle_index = 0;
 
-        particles[i] = (Particle){ x, y, 0, 0, 0, 0, 50, 100 + rand() % 156, 200 + rand() % 55, false };
-        prev_positions[i][0] = x / (float)WIDTH;
-        prev_positions[i][1] = y / (float)HEIGHT;
-    }
+    // Generate random clusters
+    for (int p = 0; p < num_planets; p++) {
+        float cluster_radius = 80.0f + (rand() % 100);
+        float cx = cluster_radius + (rand() % (int)(WIDTH - 2 * cluster_radius));
+        float cy = cluster_radius + (rand() % (int)(HEIGHT - 2 * cluster_radius));
 
-    // Second (right) cluster
-    for (int i = HALF_PARTICLES; i < NUM_PARTICLES; i++) {
-        int attempts = 0;
-        float x, y;
-        do {
-            float angle = ((float)rand() / RAND_MAX) * 2.0f * M_PI;
-            float radius = sqrtf((float)rand() / RAND_MAX) * cluster_radius;
-            x = cx2 + cosf(angle) * radius;
-            y = cy2 + sinf(angle) * radius;
-        } while (!is_position_valid(HALF_PARTICLES, i, x, y) && ++attempts < max_attempts);
+        int count = base_particles + (p == num_planets - 1 ? remainder : 0);
 
-        particles[i] = (Particle){ x, y, 0, 0, 0, 0, 200 + rand() % 55, 50, 50 + rand() % 100, false };
-        prev_positions[i][0] = x / (float)WIDTH;
-        prev_positions[i][1] = y / (float)HEIGHT;
+        unsigned char r = rand() % 256;
+        unsigned char g = rand() % 256;
+        unsigned char b = rand() % 256;
+
+        for (int i = 0; i < count; i++) {
+            int attempts = 0;
+            float x, y;
+            do {
+                float angle = ((float)rand() / RAND_MAX) * 2.0f * M_PI;
+                float radius = sqrtf((float)rand() / RAND_MAX) * cluster_radius;
+                x = cx + cosf(angle) * radius;
+                y = cy + sinf(angle) * radius;
+            } while (!is_position_valid(particle_index, particle_index + i, x, y) && ++attempts < max_attempts);
+
+            particles[particle_index + i] = (Particle){
+                x, y,
+                0, 0,
+                0, 0,
+                r, g, b
+            };
+            prev_positions[particle_index + i][0] = x / (float)WIDTH;
+            prev_positions[particle_index + i][1] = y / (float)HEIGHT;
+        }
+
+        particle_index += count;
     }
 }
 
-// Simple filled-circle rasterization using scanlines
 void draw_filled_circle(SDL_Renderer *renderer, int cx, int cy, int radius) {
     for (int dy = -radius; dy <= radius; dy++) {
-        int dx_limit = (int)sqrt(radius * radius - dy * dy);
+        int dx_limit = (int)sqrtf((float)(radius * radius - dy * dy));
         for (int dx = -dx_limit; dx <= dx_limit; dx++) {
             SDL_RenderDrawPoint(renderer, cx + dx, cy + dy);
         }
     }
 }
 
-// Calculates pairwise interactions between particles:
-// gravitational attraction + pressure and viscosity (short-range collision handling)
-// -> setzt auch collision_flag für beteiligte Partikel
 void compute_forces() {
     #pragma omp parallel for
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        particles[i].fx = 0;
-        particles[i].fy = 0;
-        particles[i].collision_flag = false; // Reset collision flag vor neuer Berechnung
+        particles[i].fx = 0.0f;
+        particles[i].fy = 0.0f;
     }
 
     #pragma omp parallel for schedule(dynamic)
@@ -185,7 +199,7 @@ void compute_forces() {
                 #pragma omp atomic
                 particles[j].fy -= fy;
 
-                // Short-range collision response
+                // Collision handling
                 if (dist < DIAMETER) {
                     float overlap = DIAMETER - dist;
                     float nx = dx / dist, ny = dy / dist;
@@ -216,17 +230,12 @@ void compute_forces() {
                     particles[j].vx -= viscx;
                     #pragma omp atomic
                     particles[j].vy -= viscy;
-
-                    // Setze collision_flag bei Kollision für beide Partikel
-                    particles[i].collision_flag = true;
-                    particles[j].collision_flag = true;
                 }
             }
         }
     }
 }
 
-// Apply accumulated forces and update position; include boundary handling
 void update_particles() {
     for (int i = 0; i < NUM_PARTICLES; i++) {
         Particle *p = &particles[i];
@@ -244,7 +253,6 @@ void update_particles() {
     }
 }
 
-// Render all particles to screen
 void draw_particles(SDL_Renderer *renderer) {
     for (int i = 0; i < NUM_PARTICLES; i++) {
         SDL_SetRenderDrawColor(renderer, particles[i].r, particles[i].g, particles[i].b, 255);
@@ -252,49 +260,89 @@ void draw_particles(SDL_Renderer *renderer) {
     }
 }
 
-// Save per-frame input/output data for ML model training
 void save_frame_to_buffer(int frame) {
     float *inputs = all_inputs[frame];
     float *targets = all_targets[frame];
 
-    // Inputs: x, y, vx, vy, nearest_distance (normalized pos & raw velocity & dist)
+    // Global gravity force (constant for all particles)
+    float gx = 0.0f;
+    float gy = G_CONST;
+
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        float min_dist_sq = 1e9f;
+        // Find 3 nearest neighbors
+        float min_dists_sq[3] = {1e30f, 1e30f, 1e30f};
+        int min_idx[3] = {-1, -1, -1};
+
         for (int j = 0; j < NUM_PARTICLES; j++) {
             if (i == j) continue;
             float dx = particles[j].x - particles[i].x;
             float dy = particles[j].y - particles[i].y;
-            float dist_sq = dx * dx + dy * dy;
-            if (dist_sq < min_dist_sq) {
-                min_dist_sq = dist_sq;
+            float dsq = dx*dx + dy*dy;
+
+            if (dsq < min_dists_sq[0]) {
+                min_dists_sq[2] = min_dists_sq[1]; min_idx[2] = min_idx[1];
+                min_dists_sq[1] = min_dists_sq[0]; min_idx[1] = min_idx[0];
+                min_dists_sq[0] = dsq;             min_idx[0] = j;
+            } else if (dsq < min_dists_sq[1]) {
+                min_dists_sq[2] = min_dists_sq[1]; min_idx[2] = min_idx[1];
+                min_dists_sq[1] = dsq;             min_idx[1] = j;
+            } else if (dsq < min_dists_sq[2]) {
+                min_dists_sq[2] = dsq;             min_idx[2] = j;
             }
         }
-        float nearest_dist = sqrtf(min_dist_sq);
 
-        inputs[i*5 + 0] = particles[i].x / (float)WIDTH;
-        inputs[i*5 + 1] = particles[i].y / (float)HEIGHT;
-        inputs[i*5 + 2] = particles[i].vx;
-        inputs[i*5 + 3] = particles[i].vy;
-        inputs[i*5 + 4] = nearest_dist / (float)WIDTH;
+        // Particle state (normalized to [0,1])
+        inputs[i*18 + 0] = particles[i].x / (float)WIDTH;
+        inputs[i*18 + 1] = particles[i].y / (float)HEIGHT;
+        inputs[i*18 + 2] = particles[i].vx / (float)WIDTH;
+        inputs[i*18 + 3] = particles[i].vy / (float)HEIGHT;
+
+        // Relative positions and velocities of 3 nearest neighbors
+        for (int k = 0; k < 3; k++) {
+            int ni = min_idx[k];
+            if (ni >= 0) {
+                float dx = (particles[ni].x - particles[i].x) / (float)WIDTH;
+                float dy = (particles[ni].y - particles[i].y) / (float)HEIGHT;
+                float dvx = (particles[ni].vx - particles[i].vx) / (float)WIDTH;
+                float dvy = (particles[ni].vy - particles[i].vy) / (float)HEIGHT;
+                inputs[i*18 + 4 + k*4 + 0] = dx;
+                inputs[i*18 + 4 + k*4 + 1] = dy;
+                inputs[i*18 + 4 + k*4 + 2] = dvx;
+                inputs[i*18 + 4 + k*4 + 3] = dvy;
+            } else {
+                inputs[i*18 + 4 + k*4 + 0] = 0.0f;
+                inputs[i*18 + 4 + k*4 + 1] = 0.0f;
+                inputs[i*18 + 4 + k*4 + 2] = 0.0f;
+                inputs[i*18 + 4 + k*4 + 3] = 0.0f;
+            }
+        }
+
+        // Global gravity as additional features
+        inputs[i*18 + 16] = gx;
+        inputs[i*18 + 17] = gy;
     }
 
     compute_forces();
     update_particles();
 
-    // Targets: delta-x, delta-y, vx, vy (positions delta + velocity)
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        float x_norm = particles[i].x / (float)WIDTH;
-        float y_norm = particles[i].y / (float)HEIGHT;
-        targets[i*4 + 0] = x_norm - inputs[i*5 + 0];
-        targets[i*4 + 1] = y_norm - inputs[i*5 + 1];
-        targets[i*4 + 2] = particles[i].vx;
-        targets[i*4 + 3] = particles[i].vy;
+        float x_new = particles[i].x / (float)WIDTH;
+        float y_new = particles[i].y / (float)HEIGHT;
+
+        // Position changes
+        targets[i*6 + 0] = x_new - inputs[i*18 + 0];
+        targets[i*6 + 1] = y_new - inputs[i*18 + 1];
+        // Velocity changes (acceleration)
+        targets[i*6 + 2] = particles[i].vx / (float)WIDTH - inputs[i*18 + 2];
+        targets[i*6 + 3] = particles[i].vy / (float)HEIGHT - inputs[i*18 + 3];
+        // New velocities
+        targets[i*6 + 4] = particles[i].vx / (float)WIDTH;
+        targets[i*6 + 5] = particles[i].vy / (float)HEIGHT;
     }
 }
 
-// Write all frame data to SQLite database (as blobs)
 int write_all_frames_to_db(const char *table_name, int total_frames) {
-    char sql[256];
+    char sql[512];
     snprintf(sql, sizeof(sql), "INSERT INTO %s (inputs, targets) VALUES (?, ?);", table_name);
 
     sqlite3_stmt *stmt;
@@ -311,8 +359,10 @@ int write_all_frames_to_db(const char *table_name, int total_frames) {
         sqlite3_reset(stmt);
         sqlite3_clear_bindings(stmt);
 
-        sqlite3_bind_blob(stmt, 1, all_inputs[i], NUM_PARTICLES * 5 * sizeof(float), SQLITE_STATIC);
-        sqlite3_bind_blob(stmt, 2, all_targets[i], NUM_PARTICLES * 4 * sizeof(float), SQLITE_STATIC);
+        rc = sqlite3_bind_blob(stmt, 1, all_inputs[i], (int)(NUM_PARTICLES * 18 * sizeof(float)), SQLITE_TRANSIENT);
+        if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL); return rc; }
+        rc = sqlite3_bind_blob(stmt, 2, all_targets[i], (int)(NUM_PARTICLES * 6 * sizeof(float)), SQLITE_TRANSIENT);
+        if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL); return rc; }
 
         rc = sqlite3_step(stmt);
         if (rc != SQLITE_DONE) {
@@ -326,7 +376,19 @@ int write_all_frames_to_db(const char *table_name, int total_frames) {
     return sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 }
 
-// Main simulation loop: handles rendering, recording, and database writing
+// Check if majority of particles have stopped moving
+bool check_particles_stopped() {
+    int count_slow = 0;
+    for (int i = 0; i < NUM_PARTICLES; i++) {
+        float speed = sqrtf(particles[i].vx * particles[i].vx + particles[i].vy * particles[i].vy);
+        if (speed < VELOCITY_THRESHOLD) {
+            count_slow++;
+        }
+    }
+    float ratio = (float)count_slow / NUM_PARTICLES;
+    return ratio >= STOP_RATIO;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <table_name>\n", argv[0]);
@@ -349,7 +411,7 @@ int main(int argc, char *argv[]) {
 
     sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
 
-    char sql_create[512];
+    char sql_create[1024];
     snprintf(sql_create, sizeof(sql_create),
         "CREATE TABLE IF NOT EXISTS %s (id INTEGER PRIMARY KEY AUTOINCREMENT, inputs BLOB NOT NULL, targets BLOB NOT NULL);", table_name);
 
@@ -375,7 +437,8 @@ int main(int argc, char *argv[]) {
     int total_frames = MAX_FRAMES;
     allocate_frame_buffers(total_frames);
 
-    for (int frame = 0; frame < total_frames; frame++) {
+    int frame = 0;
+    while (frame < total_frames) {
         if (enable_visualization) {
             SDL_Event event;
             while (SDL_PollEvent(&event)) if (event.type == SDL_QUIT) goto done;
@@ -384,8 +447,18 @@ int main(int argc, char *argv[]) {
             draw_particles(renderer);
             SDL_RenderPresent(renderer);
         }
+
         save_frame_to_buffer(frame);
+
+        // Early stopping when particles settle
+        if (check_particles_stopped()) {
+            printf("Recording stopped at frame %d: >90%% particles slow\n", frame);
+            total_frames = frame + 1;
+            break;
+        }
+
         SDL_Delay(FRAME_TIME);
+        frame++;
     }
 
 done:
@@ -395,6 +468,7 @@ done:
 
     free_frame_buffers(total_frames);
     sqlite3_close(db);
+
     if (enable_visualization) {
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
