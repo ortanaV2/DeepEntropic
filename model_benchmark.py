@@ -194,7 +194,11 @@ def run_benchmark(args):
     for frame in range(args.total_frames):
         t0 = time.time()
 
-        # Build input tensor with gravity feature
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("Positions contain NaN oder Inf")
+        if not np.all(np.isfinite(velocities)):
+            raise ValueError("Velocities contain NaN oder Inf")
+
         x_np = build_input_numpy(positions, velocities)
 
         with torch.no_grad():
@@ -203,6 +207,10 @@ def run_benchmark(args):
             out_np = out.cpu().numpy()
 
         # Update normalized positions with predicted dx, dy
+        max_dv = 0.1
+        out_np[:, 2] = np.clip(out_np[:, 2], -max_dv, max_dv)
+        out_np[:, 3] = np.clip(out_np[:, 3], -max_dv, max_dv)
+
         norm_pos = np.empty((num, 2), dtype=np.float32)
         norm_pos[:, 0] = positions[:, 0] / WIDTH
         norm_pos[:, 1] = positions[:, 1] / HEIGHT
