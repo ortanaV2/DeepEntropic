@@ -1,4 +1,4 @@
-<img width="1920" height="575" alt="Deep_Entropic_Logo_Crop" src="https://github.com/user-attachments/assets/97c727dc-d3e9-4d1d-9af9-99a51cd551ca" />
+<img width="1920" height="513" alt="Deep_Entropic_Logo_Crop" src="https://github.com/user-attachments/assets/9ca98687-d315-4a30-90ae-b5a42a3baa3a" />
 
 #### Registered Project for the Austrian Society for Artificial Intelligence (ASAI) Competition (BWKI): Accelerating Physical Simulations Using Neural Networks.
 
@@ -18,6 +18,7 @@ At its core, DeepEntropic is a hybrid simulation and machine learning framework 
 ```
 DeepEntropic/
 ├── simulation.c                # Particle simulation (C, SDL2, SQLite)
+
 ├── simulation_supervisor.py    # Parallel batch runner for simulation
 ├── model_training.py           # PyTorch training script
 ├── model_benchmark.py          # Model evaluation & visualization
