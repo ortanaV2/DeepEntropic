@@ -1,4 +1,4 @@
-<img width="1920" height="510" alt="Deep_Entropic_Logo_Crop" src="https://github.com/user-attachments/assets/eedcb52c-f9e3-4c83-b5aa-51903bfd249c" />
+<img width="1920" height="575" alt="Deep_Entropic_Logo_Crop" src="https://github.com/user-attachments/assets/97c727dc-d3e9-4d1d-9af9-99a51cd551ca" />
 
 #### Registered Project for the Austrian Society for Artificial Intelligence (ASAI) Competition (BWKI): Accelerating Physical Simulations Using Neural Networks.
 
