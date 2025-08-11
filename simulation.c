@@ -27,6 +27,8 @@
 #define FRAME_TIME 8
 #define RECORD_SECONDS 10
 
+#define NUM_NEIGHBORS 500
+
 // Movement detection parameters for early stopping
 #define VELOCITY_THRESHOLD 0.1f  // speed threshold for considering particles as stopped
 #define STOP_RATIO 0.85f         // fraction of particles that must be stopped to end recording
@@ -65,7 +67,7 @@ void allocate_frame_buffers(int total_frames) {
         exit(1);
     }
     for (int i = 0; i < total_frames; i++) {
-        all_inputs[i] = malloc(NUM_PARTICLES * 18 * sizeof(float));  // 18 features: particle state + 3 neighbors + gravity
+        all_inputs[i] = malloc(NUM_PARTICLES * 86 * sizeof(float));
         all_targets[i] = malloc(NUM_PARTICLES * 6 * sizeof(float));  // 6 targets: dx, dy, dvx, dvy, vx, vy
         if (!all_inputs[i] || !all_targets[i]) {
             fprintf(stderr, "Memory allocation failed for frame %d\n", i);
@@ -269,57 +271,68 @@ void save_frame_to_buffer(int frame) {
     float gy = G_CONST;
 
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        // Find 3 nearest neighbors
-        float min_dists_sq[3] = {1e30f, 1e30f, 1e30f};
-        int min_idx[3] = {-1, -1, -1};
+        // Find 500 nearest neighbors
+        float min_dists_sq[NUM_NEIGHBORS];
+        int min_idx[NUM_NEIGHBORS];
+        
+        // Initialize with large distances
+        for (int k = 0; k < NUM_NEIGHBORS; k++) {
+            min_dists_sq[k] = 1e30f;
+            min_idx[k] = -1;
+        }
 
+        // Find the 500 closest particles
         for (int j = 0; j < NUM_PARTICLES; j++) {
             if (i == j) continue;
             float dx = particles[j].x - particles[i].x;
             float dy = particles[j].y - particles[i].y;
             float dsq = dx*dx + dy*dy;
 
-            if (dsq < min_dists_sq[0]) {
-                min_dists_sq[2] = min_dists_sq[1]; min_idx[2] = min_idx[1];
-                min_dists_sq[1] = min_dists_sq[0]; min_idx[1] = min_idx[0];
-                min_dists_sq[0] = dsq;             min_idx[0] = j;
-            } else if (dsq < min_dists_sq[1]) {
-                min_dists_sq[2] = min_dists_sq[1]; min_idx[2] = min_idx[1];
-                min_dists_sq[1] = dsq;             min_idx[1] = j;
-            } else if (dsq < min_dists_sq[2]) {
-                min_dists_sq[2] = dsq;             min_idx[2] = j;
+            // Insert this distance in sorted order
+            for (int k = 0; k < NUM_NEIGHBORS; k++) {
+                if (dsq < min_dists_sq[k]) {
+                    // Shift everything down
+                    for (int l = NUM_NEIGHBORS - 1; l > k; l--) {
+                        min_dists_sq[l] = min_dists_sq[l-1];
+                        min_idx[l] = min_idx[l-1];
+                    }
+                    // Insert at position k
+                    min_dists_sq[k] = dsq;
+                    min_idx[k] = j;
+                    break;
+                }
             }
         }
 
         // Particle state (normalized to [0,1])
-        inputs[i*18 + 0] = particles[i].x / (float)WIDTH;
-        inputs[i*18 + 1] = particles[i].y / (float)HEIGHT;
-        inputs[i*18 + 2] = particles[i].vx / (float)WIDTH;
-        inputs[i*18 + 3] = particles[i].vy / (float)HEIGHT;
+        inputs[i*86 + 0] = particles[i].x / (float)WIDTH;
+        inputs[i*86 + 1] = particles[i].y / (float)HEIGHT;
+        inputs[i*86 + 2] = particles[i].vx / (float)WIDTH;
+        inputs[i*86 + 3] = particles[i].vy / (float)HEIGHT;
 
-        // Relative positions and velocities of 3 nearest neighbors
-        for (int k = 0; k < 3; k++) {
+        // Relative positions and velocities of 500 nearest neighbors
+        for (int k = 0; k < NUM_NEIGHBORS; k++) {
             int ni = min_idx[k];
             if (ni >= 0) {
                 float dx = (particles[ni].x - particles[i].x) / (float)WIDTH;
                 float dy = (particles[ni].y - particles[i].y) / (float)HEIGHT;
                 float dvx = (particles[ni].vx - particles[i].vx) / (float)WIDTH;
                 float dvy = (particles[ni].vy - particles[i].vy) / (float)HEIGHT;
-                inputs[i*18 + 4 + k*4 + 0] = dx;
-                inputs[i*18 + 4 + k*4 + 1] = dy;
-                inputs[i*18 + 4 + k*4 + 2] = dvx;
-                inputs[i*18 + 4 + k*4 + 3] = dvy;
+                inputs[i*86 + 4 + k*4 + 0] = dx;
+                inputs[i*86 + 4 + k*4 + 1] = dy;
+                inputs[i*86 + 4 + k*4 + 2] = dvx;
+                inputs[i*86 + 4 + k*4 + 3] = dvy;
             } else {
-                inputs[i*18 + 4 + k*4 + 0] = 0.0f;
-                inputs[i*18 + 4 + k*4 + 1] = 0.0f;
-                inputs[i*18 + 4 + k*4 + 2] = 0.0f;
-                inputs[i*18 + 4 + k*4 + 3] = 0.0f;
+                inputs[i*86 + 4 + k*4 + 0] = 0.0f;
+                inputs[i*86 + 4 + k*4 + 1] = 0.0f;
+                inputs[i*86 + 4 + k*4 + 2] = 0.0f;
+                inputs[i*86 + 4 + k*4 + 3] = 0.0f;
             }
         }
 
         // Global gravity as additional features
-        inputs[i*18 + 16] = gx;
-        inputs[i*18 + 17] = gy;
+        inputs[i*86 + 84] = gx;
+        inputs[i*86 + 85] = gy;
     }
 
     compute_forces();
@@ -330,11 +343,11 @@ void save_frame_to_buffer(int frame) {
         float y_new = particles[i].y / (float)HEIGHT;
 
         // Position changes
-        targets[i*6 + 0] = x_new - inputs[i*18 + 0];
-        targets[i*6 + 1] = y_new - inputs[i*18 + 1];
+        targets[i*6 + 0] = x_new - inputs[i*86 + 0];
+        targets[i*6 + 1] = y_new - inputs[i*86 + 1];
         // Velocity changes (acceleration)
-        targets[i*6 + 2] = particles[i].vx / (float)WIDTH - inputs[i*18 + 2];
-        targets[i*6 + 3] = particles[i].vy / (float)HEIGHT - inputs[i*18 + 3];
+        targets[i*6 + 2] = particles[i].vx / (float)WIDTH - inputs[i*86 + 2];
+        targets[i*6 + 3] = particles[i].vy / (float)HEIGHT - inputs[i*86 + 3];
         // New velocities
         targets[i*6 + 4] = particles[i].vx / (float)WIDTH;
         targets[i*6 + 5] = particles[i].vy / (float)HEIGHT;
@@ -359,7 +372,7 @@ int write_all_frames_to_db(const char *table_name, int total_frames) {
         sqlite3_reset(stmt);
         sqlite3_clear_bindings(stmt);
 
-        rc = sqlite3_bind_blob(stmt, 1, all_inputs[i], (int)(NUM_PARTICLES * 18 * sizeof(float)), SQLITE_TRANSIENT);
+        rc = sqlite3_bind_blob(stmt, 1, all_inputs[i], (int)(NUM_PARTICLES * 86 * sizeof(float)), SQLITE_TRANSIENT);
         if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL); return rc; }
         rc = sqlite3_bind_blob(stmt, 2, all_targets[i], (int)(NUM_PARTICLES * 6 * sizeof(float)), SQLITE_TRANSIENT);
         if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL); return rc; }

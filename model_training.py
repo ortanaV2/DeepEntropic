@@ -11,16 +11,16 @@ from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Input layout: particle state + 3 nearest neighbor deltas + global force
-INPUT_FEATURE_NAMES = [
-    "x", "y", "vx", "vy",
-    "n1_dx", "n1_dy", "n1_dvx", "n1_dvy",
-    "n2_dx", "n2_dy", "n2_dvx", "n2_dvy",
-    "n3_dx", "n3_dy", "n3_dvx", "n3_dvy",
-    "gx", "gy"
-]
+# Input layout: particle state + 500 nearest neighbor deltas + global force
+INPUT_FEATURE_NAMES = ["x", "y", "vx", "vy"]
 
-# Physics simulation outputs: position and velocity changes
+for i in range(1, 501):
+    INPUT_FEATURE_NAMES.extend([
+        f"n{i}_dx", f"n{i}_dy", f"n{i}_dvx", f"n{i}_dvy"
+    ])
+
+INPUT_FEATURE_NAMES.extend(["gx", "gy"])
+
 TARGET_FEATURE_NAMES = ["dx", "dy", "dvx", "dvy"]
 
 def build_feature_indices(feature_names):

@@ -17,7 +17,8 @@ FRAME_TIME = 0.016
 RECORD_SECONDS = 60
 TOTAL_FRAMES = int(RECORD_SECONDS / FRAME_TIME)
 
-INPUT_DIM = 18   # x,y,vx,vy + 3 * (dx,dy,dvx,dvy) + gx, gy
+NUM_NEIGHBORS = 500
+INPUT_DIM = 2006   # x,y,vx,vy + NUM_N * (dx,dy,dvx,dvy) + gx, gy
 HIDDEN_DIM = 128
 OUTPUT_DIM = 4   # dx, dy, dvx, dvy
 
@@ -94,7 +95,7 @@ def init_particles_from_clusters(num_particles=NUM_PARTICLES, cluster_radius=150
 def build_input_numpy(positions, velocities):
     """
     Build input features including normalized particle states,
-    nearest neighbor deltas and global gravity (gx, gy).
+    500 nearest neighbor deltas and global gravity (gx, gy).
     """
     N = positions.shape[0]
 
@@ -104,20 +105,21 @@ def build_input_numpy(positions, velocities):
     vx_norm = (velocities[:, 0] / WIDTH).astype(np.float32)
     vy_norm = (velocities[:, 1] / HEIGHT).astype(np.float32)
 
-    # Find 3 nearest neighbors per particle
+    # Find 500 nearest neighbors per particle (k=501 because first result is the particle itself)
     tree = cKDTree(positions)
-    _, idxs = tree.query(positions, k=4, workers=-1)
-    nbr_idx = idxs[:, 1:4]
+    _, idxs = tree.query(positions, k=NUM_NEIGHBORS + 1, workers=-1)
+    nbr_idx = idxs[:, 1:NUM_NEIGHBORS + 1]  # Skip first column (self)
 
     nbr_pos = positions[nbr_idx]
     nbr_vel = velocities[nbr_idx]
 
-    pos_exp = positions[:, None, :]
-    vel_exp = velocities[:, None, :]
+    pos_exp = positions[:, None, :]  # Shape: (N, 1, 2)
+    vel_exp = velocities[:, None, :]  # Shape: (N, 1, 2)
 
-    rel_pos = nbr_pos - pos_exp
-    rel_vel = nbr_vel - vel_exp
+    rel_pos = nbr_pos - pos_exp  # Shape: (N, NUM_NEIGHBORS, 2)
+    rel_vel = nbr_vel - vel_exp  # Shape: (N, NUM_NEIGHBORS, 2)
 
+    # Normalize relative positions and velocities
     rel_pos[..., 0] /= WIDTH
     rel_pos[..., 1] /= HEIGHT
     rel_vel[..., 0] /= WIDTH
@@ -127,17 +129,21 @@ def build_input_numpy(positions, velocities):
     gx = 0.0
     gy = 0.1  # example gravity downward
 
+    # Build output array
     out = np.empty((N, INPUT_DIM), dtype=np.float32)
+    
+    # First 4 features: particle state
     out[:, 0:4] = np.column_stack([x_norm, y_norm, vx_norm, vy_norm])
 
+    # Next 80 features: 500 neighbors × 4 values each
     base = 4
-    for i in range(3):
+    for i in range(NUM_NEIGHBORS):
         out[:, base + i*4 : base + i*4 + 4] = np.column_stack([
             rel_pos[:, i, 0], rel_pos[:, i, 1],
             rel_vel[:, i, 0], rel_vel[:, i, 1]
         ])
 
-    # Append global gravity features for each particle
+    # Last 2 features: global gravity
     out[:, -2] = gx
     out[:, -1] = gy
 
@@ -190,6 +196,8 @@ def run_benchmark(args):
 
     t_total_start = time.time()
     frame_times = []
+
+    print(f"Starting benchmark with {NUM_NEIGHBORS} neighbors per particle (INPUT_DIM = {INPUT_DIM})")
 
     for frame in range(args.total_frames):
         t0 = time.time()
@@ -262,6 +270,12 @@ def run_benchmark(args):
             fig.canvas.flush_events()
             plt.pause(0.001)
 
+        # Print progress every 100 frames
+        if frame % 100 == 0 and frame > 0:
+            avg_time_so_far = np.mean(frame_times[-100:])
+            fps_so_far = 1.0 / avg_time_so_far if avg_time_so_far > 0 else 0.0
+            print(f"Frame {frame}: avg frame time {avg_time_so_far:.6f}s, approx FPS: {fps_so_far:.2f}")
+
     total_time = time.time() - t_total_start
     avg_frame_time = np.mean(frame_times) if frame_times else 0.0
     fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0.0
@@ -269,13 +283,14 @@ def run_benchmark(args):
     print("Benchmark finished.")
     print(f"Total frames: {args.total_frames}, Total time: {total_time:.4f}s")
     print(f"Avg frame time: {avg_frame_time:.6f}s, Approx FPS: {fps:.2f}")
+    print(f"Input dimension used: {INPUT_DIM} (4 particle + {NUM_NEIGHBORS}*4 neighbors + 2 gravity)")
 
     if do_vis:
         plt.ioff()
         plt.show(block=True)
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Optimized particle inference benchmark with gravity feature.")
+    p = argparse.ArgumentParser(description="Optimized particle inference benchmark with 500 neighbors and gravity feature.")
     p.add_argument("--model_path", type=str, default="best_mlp_model.pt", help="Path to saved model")
     p.add_argument("--num_particles", type=int, default=NUM_PARTICLES)
     p.add_argument("--total_frames", type=int, default=TOTAL_FRAMES)
