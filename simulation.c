@@ -1,4 +1,3 @@
-// simulation_fixed.c
 #include <SDL2/SDL.h>
 #include <math.h>
 #include <stdio.h>
@@ -26,8 +25,10 @@
 
 #define FRAME_TIME 8
 #define RECORD_SECONDS 10
+#define FRAME_SAMPLING 10  // Nur jeden 10. Frame speichern
 
 #define NUM_NEIGHBORS 500
+#define INPUT_DIM (4 + NUM_NEIGHBORS * 4 + 2)
 
 // Movement detection parameters for early stopping
 #define VELOCITY_THRESHOLD 0.1f  // speed threshold for considering particles as stopped
@@ -52,6 +53,7 @@ float prev_positions[NUM_PARTICLES][2];
 sqlite3 *db = NULL;
 
 #define MAX_FRAMES ((RECORD_SECONDS * 1000) / FRAME_TIME)
+#define MAX_SAVED_FRAMES (MAX_FRAMES / FRAME_SAMPLING + 1)
 
 float **all_inputs = NULL;
 float **all_targets = NULL;
@@ -59,26 +61,29 @@ float **all_targets = NULL;
 void compute_forces();
 void update_particles();
 
-void allocate_frame_buffers(int total_frames) {
-    all_inputs = malloc(sizeof(float*) * total_frames);
-    all_targets = malloc(sizeof(float*) * total_frames);
+void allocate_frame_buffers(int max_saved_frames) {
+    all_inputs = malloc(sizeof(float*) * max_saved_frames);
+    all_targets = malloc(sizeof(float*) * max_saved_frames);
     if (!all_inputs || !all_targets) {
         fprintf(stderr, "Memory allocation failed for frame pointers\n");
         exit(1);
     }
-    for (int i = 0; i < total_frames; i++) {
-        all_inputs[i] = malloc(NUM_PARTICLES * 86 * sizeof(float));
+    for (int i = 0; i < max_saved_frames; i++) {
+        all_inputs[i] = malloc(NUM_PARTICLES * INPUT_DIM * sizeof(float));
         all_targets[i] = malloc(NUM_PARTICLES * 6 * sizeof(float));  // 6 targets: dx, dy, dvx, dvy, vx, vy
         if (!all_inputs[i] || !all_targets[i]) {
             fprintf(stderr, "Memory allocation failed for frame %d\n", i);
             exit(1);
         }
     }
+    printf("Allocated buffers: INPUT_DIM = %d, Total memory per saved frame: %.2f MB\n", 
+           INPUT_DIM, (NUM_PARTICLES * INPUT_DIM * sizeof(float)) / (1024.0f * 1024.0f));
+    printf("Frame sampling: saving every %d frames, max saved frames: %d\n", FRAME_SAMPLING, max_saved_frames);
 }
 
-void free_frame_buffers(int total_frames) {
+void free_frame_buffers(int total_saved_frames) {
     if (!all_inputs || !all_targets) return;
-    for (int i = 0; i < total_frames; i++) {
+    for (int i = 0; i < total_saved_frames; i++) {
         free(all_inputs[i]);
         free(all_targets[i]);
     }
@@ -262,16 +267,16 @@ void draw_particles(SDL_Renderer *renderer) {
     }
 }
 
-void save_frame_to_buffer(int frame) {
-    float *inputs = all_inputs[frame];
-    float *targets = all_targets[frame];
+void save_frame_to_buffer(int saved_frame_index) {
+    float *inputs = all_inputs[saved_frame_index];
+    float *targets = all_targets[saved_frame_index];
 
     // Global gravity force (constant for all particles)
     float gx = 0.0f;
     float gy = G_CONST;
 
     for (int i = 0; i < NUM_PARTICLES; i++) {
-        // Find 500 nearest neighbors
+        // Find NUM_NEIGHBORS nearest neighbors
         float min_dists_sq[NUM_NEIGHBORS];
         int min_idx[NUM_NEIGHBORS];
         
@@ -281,7 +286,7 @@ void save_frame_to_buffer(int frame) {
             min_idx[k] = -1;
         }
 
-        // Find the 500 closest particles
+        // Find the NUM_NEIGHBORS closest particles
         for (int j = 0; j < NUM_PARTICLES; j++) {
             if (i == j) continue;
             float dx = particles[j].x - particles[i].x;
@@ -304,57 +309,63 @@ void save_frame_to_buffer(int frame) {
             }
         }
 
+        int base_idx = i * INPUT_DIM;
+        
         // Particle state (normalized to [0,1])
-        inputs[i*86 + 0] = particles[i].x / (float)WIDTH;
-        inputs[i*86 + 1] = particles[i].y / (float)HEIGHT;
-        inputs[i*86 + 2] = particles[i].vx / (float)WIDTH;
-        inputs[i*86 + 3] = particles[i].vy / (float)HEIGHT;
+        inputs[base_idx + 0] = particles[i].x / (float)WIDTH;
+        inputs[base_idx + 1] = particles[i].y / (float)HEIGHT;
+        inputs[base_idx + 2] = particles[i].vx / (float)WIDTH;
+        inputs[base_idx + 3] = particles[i].vy / (float)HEIGHT;
 
-        // Relative positions and velocities of 500 nearest neighbors
+        // Relative positions and velocities of NUM_NEIGHBORS nearest neighbors
         for (int k = 0; k < NUM_NEIGHBORS; k++) {
             int ni = min_idx[k];
+            int neighbor_base = base_idx + 4 + k * 4;
+            
             if (ni >= 0) {
                 float dx = (particles[ni].x - particles[i].x) / (float)WIDTH;
                 float dy = (particles[ni].y - particles[i].y) / (float)HEIGHT;
                 float dvx = (particles[ni].vx - particles[i].vx) / (float)WIDTH;
                 float dvy = (particles[ni].vy - particles[i].vy) / (float)HEIGHT;
-                inputs[i*86 + 4 + k*4 + 0] = dx;
-                inputs[i*86 + 4 + k*4 + 1] = dy;
-                inputs[i*86 + 4 + k*4 + 2] = dvx;
-                inputs[i*86 + 4 + k*4 + 3] = dvy;
+                inputs[neighbor_base + 0] = dx;
+                inputs[neighbor_base + 1] = dy;
+                inputs[neighbor_base + 2] = dvx;
+                inputs[neighbor_base + 3] = dvy;
             } else {
-                inputs[i*86 + 4 + k*4 + 0] = 0.0f;
-                inputs[i*86 + 4 + k*4 + 1] = 0.0f;
-                inputs[i*86 + 4 + k*4 + 2] = 0.0f;
-                inputs[i*86 + 4 + k*4 + 3] = 0.0f;
+                inputs[neighbor_base + 0] = 0.0f;
+                inputs[neighbor_base + 1] = 0.0f;
+                inputs[neighbor_base + 2] = 0.0f;
+                inputs[neighbor_base + 3] = 0.0f;
             }
         }
 
-        // Global gravity as additional features
-        inputs[i*86 + 84] = gx;
-        inputs[i*86 + 85] = gy;
+        // Global gravity as additional features (korrekte Indizes)
+        int gravity_base = base_idx + 4 + NUM_NEIGHBORS * 4;
+        inputs[gravity_base + 0] = gx;
+        inputs[gravity_base + 1] = gy;
     }
 
     compute_forces();
     update_particles();
 
     for (int i = 0; i < NUM_PARTICLES; i++) {
+        int base_idx = i * INPUT_DIM;
         float x_new = particles[i].x / (float)WIDTH;
         float y_new = particles[i].y / (float)HEIGHT;
 
         // Position changes
-        targets[i*6 + 0] = x_new - inputs[i*86 + 0];
-        targets[i*6 + 1] = y_new - inputs[i*86 + 1];
+        targets[i*6 + 0] = x_new - inputs[base_idx + 0];
+        targets[i*6 + 1] = y_new - inputs[base_idx + 1];
         // Velocity changes (acceleration)
-        targets[i*6 + 2] = particles[i].vx / (float)WIDTH - inputs[i*86 + 2];
-        targets[i*6 + 3] = particles[i].vy / (float)HEIGHT - inputs[i*86 + 3];
+        targets[i*6 + 2] = particles[i].vx / (float)WIDTH - inputs[base_idx + 2];
+        targets[i*6 + 3] = particles[i].vy / (float)HEIGHT - inputs[base_idx + 3];
         // New velocities
         targets[i*6 + 4] = particles[i].vx / (float)WIDTH;
         targets[i*6 + 5] = particles[i].vy / (float)HEIGHT;
     }
 }
 
-int write_all_frames_to_db(const char *table_name, int total_frames) {
+int write_all_frames_to_db(const char *table_name, int total_saved_frames) {
     char sql[512];
     snprintf(sql, sizeof(sql), "INSERT INTO %s (inputs, targets) VALUES (?, ?);", table_name);
 
@@ -368,11 +379,11 @@ int write_all_frames_to_db(const char *table_name, int total_frames) {
         return rc;
     }
 
-    for (int i = 0; i < total_frames; i++) {
+    for (int i = 0; i < total_saved_frames; i++) {
         sqlite3_reset(stmt);
         sqlite3_clear_bindings(stmt);
 
-        rc = sqlite3_bind_blob(stmt, 1, all_inputs[i], (int)(NUM_PARTICLES * 86 * sizeof(float)), SQLITE_TRANSIENT);
+        rc = sqlite3_bind_blob(stmt, 1, all_inputs[i], (int)(NUM_PARTICLES * INPUT_DIM * sizeof(float)), SQLITE_TRANSIENT);
         if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL); return rc; }
         rc = sqlite3_bind_blob(stmt, 2, all_targets[i], (int)(NUM_PARTICLES * 6 * sizeof(float)), SQLITE_TRANSIENT);
         if (rc != SQLITE_OK) { sqlite3_finalize(stmt); sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL); return rc; }
@@ -447,11 +458,13 @@ int main(int argc, char *argv[]) {
     }
 
     init_particles();
-    int total_frames = MAX_FRAMES;
-    allocate_frame_buffers(total_frames);
+    int max_saved_frames = MAX_SAVED_FRAMES;
+    allocate_frame_buffers(max_saved_frames);
 
     int frame = 0;
-    while (frame < total_frames) {
+    int saved_frame_count = 0;
+    
+    while (frame < MAX_FRAMES && saved_frame_count < max_saved_frames) {
         if (enable_visualization) {
             SDL_Event event;
             while (SDL_PollEvent(&event)) if (event.type == SDL_QUIT) goto done;
@@ -461,13 +474,23 @@ int main(int argc, char *argv[]) {
             SDL_RenderPresent(renderer);
         }
 
-        save_frame_to_buffer(frame);
-
-        // Early stopping when particles settle
-        if (check_particles_stopped()) {
-            printf("Recording stopped at frame %d: >90%% particles slow\n", frame);
-            total_frames = frame + 1;
-            break;
+        if (frame % FRAME_SAMPLING == 0) {
+            save_frame_to_buffer(saved_frame_count);
+            printf("Saved frame %d (simulation frame %d)\n", saved_frame_count, frame);
+            saved_frame_count++;
+            
+            // Early stopping when particles settle
+            if (check_particles_stopped()) {
+                printf("Recording stopped at saved frame %d (simulation frame %d): >85%% particles slow\n", 
+                       saved_frame_count - 1, frame);
+                break;
+            }
+        } else {
+            compute_forces();
+            update_particles();
+            if (frame % 50 == 0) {
+                printf("Simulation frame %d (not saved)\n", frame);
+            }
         }
 
         SDL_Delay(FRAME_TIME);
@@ -475,11 +498,13 @@ int main(int argc, char *argv[]) {
     }
 
 done:
-    if (write_all_frames_to_db(table_name, total_frames) != SQLITE_OK) {
+    printf("Total simulation frames: %d, Saved frames: %d\n", frame, saved_frame_count);
+    
+    if (write_all_frames_to_db(table_name, saved_frame_count) != SQLITE_OK) {
         fprintf(stderr, "Error writing frames to database\n");
     }
 
-    free_frame_buffers(total_frames);
+    free_frame_buffers(max_saved_frames);
     sqlite3_close(db);
 
     if (enable_visualization) {

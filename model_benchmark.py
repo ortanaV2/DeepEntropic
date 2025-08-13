@@ -22,6 +22,7 @@ INPUT_DIM = 2006   # x,y,vx,vy + NUM_N * (dx,dy,dvx,dvy) + gx, gy
 HIDDEN_DIM = 128
 OUTPUT_DIM = 4   # dx, dy, dvx, dvy
 
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class SimpleMLP(nn.Module):
@@ -296,7 +297,7 @@ def parse_args():
     p.add_argument("--total_frames", type=int, default=TOTAL_FRAMES)
     p.add_argument("--hidden_dim", type=int, default=HIDDEN_DIM)
     p.add_argument("--use_jit", action="store_true", help="Use TorchScript compilation for faster inference")
-    p.add_argument("--visualize", type=int, default=0, help="Enable visualization (0/1)")
+    p.add_argument("--visualize", type=int, default=1, help="Enable visualization (0/1)")
     p.add_argument("--vis_every", type=int, default=1, help="Update visualization every N frames")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cluster_radius", type=float, default=150.0)
