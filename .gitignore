@@ -1,0 +1,8 @@
+dataset.db-shm
+dataset.db-wal
+
+*.pt
+
+*.exe
+
+.vscode/

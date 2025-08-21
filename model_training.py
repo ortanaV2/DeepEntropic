@@ -195,8 +195,8 @@ def load_sqlite_progressive(db_path, table_name, max_clip=1.0, limit=None):
         cursor.execute(f"SELECT rowid FROM {table_name}")
         selected_rowids = [row[0] for row in cursor.fetchall()]
 
-    # Use smaller chunk sizes
-    chunk_size = 10000  # Adjustable based on available RAM
+    # Use smaller chunk sizes to avoid memory spikes
+    chunk_size = 5000 
     x_chunks, y_chunks = [], []
 
     for i in tqdm(range(0, len(selected_rowids), chunk_size), desc="Loading chunks"):
@@ -245,12 +245,14 @@ def load_sqlite_progressive(db_path, table_name, max_clip=1.0, limit=None):
     if not x_chunks:
         raise ValueError("No data loaded.")
 
-    # Final concatenation
+    # Final concatenation with immediate cleanup to minimize peak memory
+    print("Performing final tensor concatenation...")
     x_final = torch.cat(x_chunks, dim=0)
-    y_final = torch.cat(y_chunks, dim=0)
+    del x_chunks  # Delete immediately after concatenation
+    gc.collect()
     
-    # Cleanup
-    del x_chunks, y_chunks
+    y_final = torch.cat(y_chunks, dim=0)
+    del y_chunks  # Delete immediately after concatenation
     gc.collect()
 
     return TensorDataset(x_final, y_final)
@@ -293,26 +295,37 @@ def main(args):
 
     train_dataset = torch.utils.data.Subset(dataset, train_indices)
     val_dataset = torch.utils.data.Subset(dataset, val_indices)
+    
+    # Clear indices to free memory
+    del indices, train_indices, val_indices
+    gc.collect()
 
-    # DataLoader with optimized settings
+    # Conservative DataLoader settings to reduce memory spikes
+    num_workers = min(args.num_workers, 2) if data_size > 100000 else 0
+    pin_memory = args.pin_memory and torch.cuda.is_available() and data_size < 500000
+    pin_memory = False  # Temporary
+
     train_loader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
         shuffle=True,
-        num_workers=args.num_workers, 
-        pin_memory=args.pin_memory and torch.cuda.is_available(),
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=2 if args.num_workers > 0 else 2
+        num_workers=num_workers, 
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=1 if num_workers > 0 else None  # Reduce prefetch to save memory
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=args.batch_size, 
         shuffle=False,
-        num_workers=args.num_workers, 
-        pin_memory=args.pin_memory and torch.cuda.is_available(),
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=2 if args.num_workers > 0 else 2
+        num_workers=num_workers, 
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=1 if num_workers > 0 else None
     )
+    
+    # Force garbage collection after DataLoader creation
+    gc.collect()
 
     model = SimpleMLP(input_dim=input_dim, hidden_dim=args.hidden_dim, output_dim=output_dim, dropout=args.dropout).to(device)
     model.apply(init_weights)

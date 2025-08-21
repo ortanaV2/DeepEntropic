@@ -22,7 +22,6 @@ INPUT_DIM = 2006   # x,y,vx,vy + NUM_N * (dx,dy,dvx,dvy) + gx, gy
 HIDDEN_DIM = 128
 OUTPUT_DIM = 4   # dx, dy, dvx, dvy
 
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class SimpleMLP(nn.Module):

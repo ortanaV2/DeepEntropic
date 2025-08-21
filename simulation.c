@@ -25,14 +25,24 @@
 
 #define FRAME_TIME 8
 #define RECORD_SECONDS 10
-#define FRAME_SAMPLING 10  // Nur jeden 10. Frame speichern
+#define FRAME_SAMPLING 10  // save every 10th frame
 
 #define NUM_NEIGHBORS 500
 #define INPUT_DIM (4 + NUM_NEIGHBORS * 4 + 2)
 
 // Movement detection parameters for early stopping
 #define VELOCITY_THRESHOLD 0.1f  // speed threshold for considering particles as stopped
-#define STOP_RATIO 0.85f         // fraction of particles that must be stopped to end recording
+#define STOP_RATIO 0.70f         // fraction of particles that must be stopped to end recording
+#define MIN_RUNTIME_SECONDS 3    // minimum runtime before early stopping can trigger
+#define MIN_FRAMES_BEFORE_STOP ((MIN_RUNTIME_SECONDS * 1000) / FRAME_TIME)
+
+// Simulation settings
+#define NUM_PLANETS 2            // number of clusters to generate (2-4 recommended)
+
+// Cluster collapse detection parameters
+#define COLLAPSE_CHECK_INTERVAL 20   // check for collapse every N frames
+#define MAX_CLUSTER_DISTANCE 300.0f  // maximum distance from cluster center before considering collapse
+#define COLLAPSE_RATIO 0.80f         // fraction of particles that must be clustered to detect collapse
 
 static const float PI_F = 3.14159265358979323846f;
 
@@ -79,6 +89,8 @@ void allocate_frame_buffers(int max_saved_frames) {
     printf("Allocated buffers: INPUT_DIM = %d, Total memory per saved frame: %.2f MB\n", 
            INPUT_DIM, (NUM_PARTICLES * INPUT_DIM * sizeof(float)) / (1024.0f * 1024.0f));
     printf("Frame sampling: saving every %d frames, max saved frames: %d\n", FRAME_SAMPLING, max_saved_frames);
+    printf("Minimum runtime: %d seconds (%d frames) before early stopping\n", MIN_RUNTIME_SECONDS, MIN_FRAMES_BEFORE_STOP);
+    printf("Cluster settings: up to %d clusters with radius=150, collapse detection at %d%% clustering\n", NUM_PLANETS, (int)(COLLAPSE_RATIO * 100));
 }
 
 void free_frame_buffers(int total_saved_frames) {
@@ -114,11 +126,17 @@ void init_particles() {
 
     const float min_dist = 2.0f * PARTICLE_RADIUS;
     const int max_attempts = 3000;
+    const float cluster_radius = 150.0f;  // constant cluster radius
+    const float min_cluster_distance = cluster_radius * 2.5f;  // minimum distance between cluster centers
 
-    int num_planets = 2 + rand() % 4; 
+    int num_planets = 1 + rand() % NUM_PLANETS;
 
     int base_particles = NUM_PARTICLES / num_planets;
     int remainder = NUM_PARTICLES % num_planets;
+
+    // Store cluster centers to ensure they don't overlap
+    float cluster_centers[6][2];  // max 6 clusters (2 + rand() % 4)
+    int placed_clusters = 0;
 
     bool is_position_valid(int cluster_start, int cluster_end, float x, float y) {
         for (int j = cluster_start; j < cluster_end; j++) {
@@ -129,13 +147,42 @@ void init_particles() {
         return true;
     }
 
+    bool is_cluster_position_valid(float cx, float cy) {
+        // Check if cluster center is within bounds
+        if (cx < cluster_radius || cx > WIDTH - cluster_radius ||
+            cy < cluster_radius || cy > HEIGHT - cluster_radius) {
+            return false;
+        }
+        
+        // Check distance to other cluster centers
+        for (int i = 0; i < placed_clusters; i++) {
+            float dx = cluster_centers[i][0] - cx;
+            float dy = cluster_centers[i][1] - cy;
+            if (sqrtf(dx*dx + dy*dy) < min_cluster_distance) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     int particle_index = 0;
 
-    // Generate random clusters
+    // Generate non-overlapping clusters
     for (int p = 0; p < num_planets; p++) {
-        float cluster_radius = 80.0f + (rand() % 100);
-        float cx = cluster_radius + (rand() % (int)(WIDTH - 2 * cluster_radius));
-        float cy = cluster_radius + (rand() % (int)(HEIGHT - 2 * cluster_radius));
+        float cx, cy;
+        int cluster_attempts = 0;
+        
+        // Find valid cluster center position
+        do {
+            cx = cluster_radius + (rand() % (int)(WIDTH - 2 * cluster_radius));
+            cy = cluster_radius + (rand() % (int)(HEIGHT - 2 * cluster_radius));
+            cluster_attempts++;
+        } while (!is_cluster_position_valid(cx, cy) && cluster_attempts < 1000);
+        
+        // Store cluster center
+        cluster_centers[placed_clusters][0] = cx;
+        cluster_centers[placed_clusters][1] = cy;
+        placed_clusters++;
 
         int count = base_particles + (p == num_planets - 1 ? remainder : 0);
 
@@ -339,7 +386,7 @@ void save_frame_to_buffer(int saved_frame_index) {
             }
         }
 
-        // Global gravity as additional features (korrekte Indizes)
+        // Global gravity as additional features
         int gravity_base = base_idx + 4 + NUM_NEIGHBORS * 4;
         inputs[gravity_base + 0] = gx;
         inputs[gravity_base + 1] = gy;
@@ -400,8 +447,50 @@ int write_all_frames_to_db(const char *table_name, int total_saved_frames) {
     return sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 }
 
-// Check if majority of particles have stopped moving
-bool check_particles_stopped() {
+// Check if clusters have collapsed into planets (gravity has done its job)
+bool check_cluster_collapse(int current_frame) {
+    // Don't check for collapse before minimum runtime
+    if (current_frame < MIN_FRAMES_BEFORE_STOP) {
+        return false;
+    }
+    
+    // Only check every COLLAPSE_CHECK_INTERVAL frames for performance
+    if (current_frame % COLLAPSE_CHECK_INTERVAL != 0) {
+        return false;
+    }
+    
+    // Calculate center of mass
+    float center_x = 0.0f, center_y = 0.0f;
+    for (int i = 0; i < NUM_PARTICLES; i++) {
+        center_x += particles[i].x;
+        center_y += particles[i].y;
+    }
+    center_x /= NUM_PARTICLES;
+    center_y /= NUM_PARTICLES;
+    
+    // Count particles within collapse distance from center of mass
+    int particles_clustered = 0;
+    for (int i = 0; i < NUM_PARTICLES; i++) {
+        float dx = particles[i].x - center_x;
+        float dy = particles[i].y - center_y;
+        float distance = sqrtf(dx*dx + dy*dy);
+        
+        if (distance <= MAX_CLUSTER_DISTANCE) {
+            particles_clustered++;
+        }
+    }
+    
+    float cluster_ratio = (float)particles_clustered / NUM_PARTICLES;
+    return cluster_ratio >= COLLAPSE_RATIO;
+}
+
+// Check if majority of particles have stopped moving (only after minimum runtime)
+bool check_particles_stopped(int current_frame) {
+    // Don't check for early stopping before minimum runtime
+    if (current_frame < MIN_FRAMES_BEFORE_STOP) {
+        return false;
+    }
+    
     int count_slow = 0;
     for (int i = 0; i < NUM_PARTICLES; i++) {
         float speed = sqrtf(particles[i].vx * particles[i].vx + particles[i].vy * particles[i].vy);
@@ -479,10 +568,19 @@ int main(int argc, char *argv[]) {
             printf("Saved frame %d (simulation frame %d)\n", saved_frame_count, frame);
             saved_frame_count++;
             
-            // Early stopping when particles settle
-            if (check_particles_stopped()) {
-                printf("Recording stopped at saved frame %d (simulation frame %d): >85%% particles slow\n", 
-                       saved_frame_count - 1, frame);
+            // Check for cluster collapse first (priority - stop before planets collide)
+            if (check_cluster_collapse(frame)) {
+                float runtime_seconds = (float)frame * FRAME_TIME / 1000.0f;
+                printf("Recording stopped at saved frame %d (simulation frame %d, %.1fs): clusters collapsed into planets\n", 
+                       saved_frame_count - 1, frame, runtime_seconds);
+                break;
+            }
+            
+            // Fallback: Early stopping when particles settle (only after minimum runtime)
+            if (check_particles_stopped(frame)) {
+                float runtime_seconds = (float)frame * FRAME_TIME / 1000.0f;
+                printf("Recording stopped at saved frame %d (simulation frame %d, %.1fs): >70%% particles slow\n", 
+                       saved_frame_count - 1, frame, runtime_seconds);
                 break;
             }
         } else {
@@ -498,7 +596,9 @@ int main(int argc, char *argv[]) {
     }
 
 done:
-    printf("Total simulation frames: %d, Saved frames: %d\n", frame, saved_frame_count);
+    float total_runtime_seconds = (float)frame * FRAME_TIME / 1000.0f;
+    printf("Total simulation frames: %d, Saved frames: %d, Runtime: %.1f seconds\n", 
+           frame, saved_frame_count, total_runtime_seconds);
     
     if (write_all_frames_to_db(table_name, saved_frame_count) != SQLITE_OK) {
         fprintf(stderr, "Error writing frames to database\n");
