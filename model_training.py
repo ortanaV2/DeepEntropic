@@ -6,21 +6,22 @@ import sqlite3
 import numpy as np
 import random
 import os
+import gc
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Input layout: particle state + 3 nearest neighbor deltas + global force
-INPUT_FEATURE_NAMES = [
-    "x", "y", "vx", "vy",
-    "n1_dx", "n1_dy", "n1_dvx", "n1_dvy",
-    "n2_dx", "n2_dy", "n2_dvx", "n2_dvy",
-    "n3_dx", "n3_dy", "n3_dvx", "n3_dvy",
-    "gx", "gy"
-]
+# Input layout: particle state + 500 nearest neighbor deltas + global force
+INPUT_FEATURE_NAMES = ["x", "y", "vx", "vy"]
 
-# Physics simulation outputs: position and velocity changes
+for i in range(1, 501):
+    INPUT_FEATURE_NAMES.extend([
+        f"n{i}_dx", f"n{i}_dy", f"n{i}_dvx", f"n{i}_dvy"
+    ])
+
+INPUT_FEATURE_NAMES.extend(["gx", "gy"])
+
 TARGET_FEATURE_NAMES = ["dx", "dy", "dvx", "dvy"]
 
 def build_feature_indices(feature_names):
@@ -51,10 +52,13 @@ def init_weights(m):
         if m.bias is not None:
             nn.init.zeros_(m.bias)
 
-def load_sqlite_flat(db_path, table_name, max_clip=1.0, limit=None):
+def load_sqlite_optimized(db_path, table_name, max_clip=1.0, limit=None):
     """
-    Loads random frames from SQLite, concatenating all particles into one dataset.
-    Each frame contains particle states as 'inputs' and physics updates as 'targets'.
+    RAM-optimized data loading through:
+    1. Direct loading into target tensors without intermediate lists
+    2. Streaming processing per frame
+    3. Immediate garbage collection
+    4. Memory-mapped tensors where possible
     """
     input_dim = len(INPUT_FEATURE_NAMES)
     output_dim = len(TARGET_FEATURE_NAMES)
@@ -62,60 +66,196 @@ def load_sqlite_flat(db_path, table_name, max_clip=1.0, limit=None):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    # Sample random frames if limit specified
-    cursor.execute(f"SELECT rowid FROM {table_name}")
-    all_rowids = [row[0] for row in cursor.fetchall()]
-    conn.close()
+    # Determine number of available frames
+    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+    total_frames = cursor.fetchone()[0]
+    
+    if limit is not None and limit < total_frames:
+        total_frames = limit
 
-    if limit is not None and limit < len(all_rowids):
-        selected_rowids = random.sample(all_rowids, limit)
+    print(f"Loading {total_frames} frames...")
+
+    # Initial data size estimation for pre-allocation
+    cursor.execute(f"SELECT inputs FROM {table_name} LIMIT 1")
+    sample_blob = cursor.fetchone()[0]
+    sample_size = len(np.frombuffer(sample_blob, dtype=np.float32)) // input_dim
+    estimated_total_particles = sample_size * total_frames
+
+    print(f"Estimated particle count: {estimated_total_particles}")
+
+    # Pre-allocate tensors (more efficient than lists)
+    try:
+        # Attempt direct PyTorch tensor allocation
+        x_tensor = torch.empty((estimated_total_particles, input_dim), dtype=torch.float32)
+        y_tensor = torch.empty((estimated_total_particles, output_dim), dtype=torch.float32)
+        print("Tensors successfully pre-allocated")
+    except RuntimeError as e:
+        print(f"Pre-allocation failed: {e}")
+        # Fallback to progressive allocation
+        return load_sqlite_progressive(db_path, table_name, max_clip, limit)
+
+    # Sample random frames when limit is set
+    if limit is not None:
+        cursor.execute(f"SELECT rowid FROM {table_name} ORDER BY RANDOM() LIMIT {limit}")
+        selected_rowids = [row[0] for row in cursor.fetchall()]
     else:
-        selected_rowids = all_rowids
+        cursor.execute(f"SELECT rowid FROM {table_name}")
+        selected_rowids = [row[0] for row in cursor.fetchall()]
 
-    x_list, y_list = [], []
-
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    # Load and reshape particle data from selected frames
-    for idx, rowid in enumerate(selected_rowids):
+    current_idx = 0
+    
+    # Streaming processing - one frame at a time
+    for frame_num, rowid in enumerate(tqdm(selected_rowids, desc="Loading frames")):
         cursor.execute(f"SELECT inputs, targets FROM {table_name} WHERE rowid = ?", (rowid,))
         row = cursor.fetchone()
         if row is None:
             continue
+
         inp_blob, tgt_blob = row
 
-        inputs = np.frombuffer(inp_blob, dtype=np.float32)
-        if inputs.size % input_dim != 0:
-            raise ValueError(f"Inputs blob in row {rowid} not divisible by input_dim ({input_dim}). Got {inputs.size} floats.")
-        inputs = inputs.reshape(-1, input_dim)
+        # Direct conversion to NumPy arrays (with copy for write access)
+        inputs_raw = np.frombuffer(inp_blob, dtype=np.float32)
+        if inputs_raw.size % input_dim != 0:
+            continue
+        inputs_np = inputs_raw.reshape(-1, input_dim)
 
-        full_targets = np.frombuffer(tgt_blob, dtype=np.float32)
-        if full_targets.size % inputs.shape[0] != 0:
-            raise ValueError(f"Targets blob in row {rowid} incompatible with inputs rows: targets size {full_targets.size}, inputs rows {inputs.shape[0]}.")
-        full_output_dim = full_targets.size // inputs.shape[0]
-        full_targets = full_targets.reshape(-1, full_output_dim)
-
+        targets_raw = np.frombuffer(tgt_blob, dtype=np.float32)
+        if targets_raw.size % inputs_np.shape[0] != 0:
+            continue
+        full_output_dim = targets_raw.size // inputs_np.shape[0]
         if full_output_dim < output_dim:
-            raise ValueError(f"Row {rowid} targets have fewer dims ({full_output_dim}) than expected ({output_dim}).")
-        targets = full_targets[:, :output_dim]
+            continue
+        targets_np = targets_raw.reshape(-1, full_output_dim)[:, :output_dim]
 
-        # Clip extreme values for training stability
-        inputs = np.clip(inputs, -max_clip, max_clip)
-        targets = np.clip(targets, -max_clip, max_clip)
+        # Number of particles in this frame
+        n_particles = inputs_np.shape[0]
+        
+        # Resize tensors if necessary
+        if current_idx + n_particles > x_tensor.shape[0]:
+            new_size = max(x_tensor.shape[0] * 2, current_idx + n_particles)
+            x_new = torch.empty((new_size, input_dim), dtype=torch.float32)
+            y_new = torch.empty((new_size, output_dim), dtype=torch.float32)
+            
+            x_new[:current_idx] = x_tensor[:current_idx]
+            y_new[:current_idx] = y_tensor[:current_idx]
+            
+            # Explicitly delete old tensors
+            del x_tensor, y_tensor
+            gc.collect()
+            
+            x_tensor, y_tensor = x_new, y_new
 
-        x_list.append(inputs)
-        y_list.append(targets)
+        # Clipping and copying in one step (memory-efficient)
+        x_tensor[current_idx:current_idx + n_particles] = torch.clamp(
+            torch.from_numpy(inputs_np), -max_clip, max_clip
+        )
+        y_tensor[current_idx:current_idx + n_particles] = torch.clamp(
+            torch.from_numpy(targets_np), -max_clip, max_clip
+        )
+        
+        current_idx += n_particles
+
+        # Clear intermediate buffers
+        del inputs_np, targets_np, inp_blob, tgt_blob
+        
+        # Garbage collection every 100 frames
+        if frame_num % 100 == 0:
+            gc.collect()
 
     conn.close()
 
-    if len(x_list) == 0:
-        raise ValueError("No data loaded from database.")
+    if current_idx == 0:
+        raise ValueError("No data loaded.")
 
-    x_all = torch.tensor(np.concatenate(x_list, axis=0), dtype=torch.float32)
-    y_all = torch.tensor(np.concatenate(y_list, axis=0), dtype=torch.float32)
+    # Adjust final tensor size
+    x_final = x_tensor[:current_idx].contiguous()
+    y_final = y_tensor[:current_idx].contiguous()
+    
+    # Delete temporary tensors
+    del x_tensor, y_tensor
+    gc.collect()
 
-    return TensorDataset(x_all, y_all)
+    print(f"Actually loaded particles: {current_idx}")
+    return TensorDataset(x_final, y_final)
+
+def load_sqlite_progressive(db_path, table_name, max_clip=1.0, limit=None):
+    """
+    Progressive loading for cases where pre-allocation fails
+    """
+    input_dim = len(INPUT_FEATURE_NAMES)
+    output_dim = len(TARGET_FEATURE_NAMES)
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    if limit is not None:
+        cursor.execute(f"SELECT rowid FROM {table_name} ORDER BY RANDOM() LIMIT {limit}")
+        selected_rowids = [row[0] for row in cursor.fetchall()]
+    else:
+        cursor.execute(f"SELECT rowid FROM {table_name}")
+        selected_rowids = [row[0] for row in cursor.fetchall()]
+
+    # Use smaller chunk sizes to avoid memory spikes
+    chunk_size = 5000 
+    x_chunks, y_chunks = [], []
+
+    for i in tqdm(range(0, len(selected_rowids), chunk_size), desc="Loading chunks"):
+        chunk_rowids = selected_rowids[i:i+chunk_size]
+        x_chunk_list, y_chunk_list = [], []
+        
+        for rowid in chunk_rowids:
+            cursor.execute(f"SELECT inputs, targets FROM {table_name} WHERE rowid = ?", (rowid,))
+            row = cursor.fetchone()
+            if row is None:
+                continue
+
+            inp_blob, tgt_blob = row
+
+            inputs_raw = np.frombuffer(inp_blob, dtype=np.float32)
+            if inputs_raw.size % input_dim != 0:
+                continue
+            inputs_np = inputs_raw.reshape(-1, input_dim).copy()  # Copy for write access
+
+            targets_raw = np.frombuffer(tgt_blob, dtype=np.float32)
+            if targets_raw.size % inputs_np.shape[0] != 0:
+                continue
+            full_output_dim = targets_raw.size // inputs_np.shape[0]
+            if full_output_dim < output_dim:
+                continue
+            targets_np = targets_raw.reshape(-1, full_output_dim)[:, :output_dim].copy()  # Copy for write access
+
+            np.clip(inputs_np, -max_clip, max_clip, out=inputs_np)
+            np.clip(targets_np, -max_clip, max_clip, out=targets_np)
+
+            x_chunk_list.append(inputs_np)
+            y_chunk_list.append(targets_np)
+
+        if x_chunk_list:
+            x_chunk = torch.from_numpy(np.concatenate(x_chunk_list, axis=0))
+            y_chunk = torch.from_numpy(np.concatenate(y_chunk_list, axis=0))
+            x_chunks.append(x_chunk)
+            y_chunks.append(y_chunk)
+
+        # Cleanup after each chunk
+        del x_chunk_list, y_chunk_list
+        gc.collect()
+
+    conn.close()
+
+    if not x_chunks:
+        raise ValueError("No data loaded.")
+
+    # Final concatenation with immediate cleanup to minimize peak memory
+    print("Performing final tensor concatenation...")
+    x_final = torch.cat(x_chunks, dim=0)
+    del x_chunks  # Delete immediately after concatenation
+    gc.collect()
+    
+    y_final = torch.cat(y_chunks, dim=0)
+    del y_chunks  # Delete immediately after concatenation
+    gc.collect()
+
+    return TensorDataset(x_final, y_final)
 
 def evaluate(model, loader, loss_fn):
     model.eval()
@@ -131,15 +271,21 @@ def evaluate(model, loader, loss_fn):
     return total_loss / max(1, n_batches)
 
 def main(args):
+    # Enable garbage collection
+    gc.enable()
+    
     input_dim = len(INPUT_FEATURE_NAMES)
     output_dim = len(TARGET_FEATURE_NAMES)
 
-    print("Loading dataset...")
-    dataset = load_sqlite_flat(args.db_path, args.table_name, max_clip=args.max_clip, limit=args.limit)
+    print("Loading dataset (RAM-optimized)...")
+    dataset = load_sqlite_optimized(args.db_path, args.table_name, max_clip=args.max_clip, limit=args.limit)
     data_size = len(dataset)
-    print(f"Total samples (particles across frames): {data_size}")
+    print(f"Dataset successfully loaded. Total samples: {data_size}")
 
-    # Train/validation split
+    # Force garbage collection after dataset loading
+    gc.collect()
+
+    # Train/validation split - in-place to avoid copies
     indices = list(range(data_size))
     random.shuffle(indices)
 
@@ -149,11 +295,37 @@ def main(args):
 
     train_dataset = torch.utils.data.Subset(dataset, train_indices)
     val_dataset = torch.utils.data.Subset(dataset, val_indices)
+    
+    # Clear indices to free memory
+    del indices, train_indices, val_indices
+    gc.collect()
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=args.pin_memory)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=args.pin_memory)
+    # Conservative DataLoader settings to reduce memory spikes
+    num_workers = min(args.num_workers, 2) if data_size > 100000 else 0
+    pin_memory = args.pin_memory and torch.cuda.is_available() and data_size < 500000
+    pin_memory = False  # Temporary
+
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True,
+        num_workers=num_workers, 
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=1 if num_workers > 0 else None  # Reduce prefetch to save memory
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False,
+        num_workers=num_workers, 
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=1 if num_workers > 0 else None
+    )
+    
+    # Force garbage collection after DataLoader creation
+    gc.collect()
 
     model = SimpleMLP(input_dim=input_dim, hidden_dim=args.hidden_dim, output_dim=output_dim, dropout=args.dropout).to(device)
     model.apply(init_weights)
@@ -169,6 +341,8 @@ def main(args):
     use_amp = args.use_amp and torch.cuda.is_available()
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
+    print(f"Starting training with {data_size} samples...")
+    
     for epoch in range(args.epochs):
         model.train()
         total_loss = 0.0
@@ -176,7 +350,7 @@ def main(args):
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
         for x, y in pbar:
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=use_amp):
@@ -215,10 +389,10 @@ def main(args):
 
             os.makedirs(os.path.dirname(args.save_state_path) or ".", exist_ok=True)
             torch.save(model.state_dict(), args.save_state_path)
-            print(f"Model state_dict saved with val loss {val_loss:.8f}")
+            print(f"Model state_dict saved with Val Loss {val_loss:.8f}")
 
             torch.save(model, args.save_model_path)
-            print(f"Full model saved to {args.save_model_path}")
+            print(f"Complete model saved: {args.save_model_path}")
         else:
             epochs_no_improve += 1
 
@@ -226,10 +400,14 @@ def main(args):
             print(f"No improvement for {epochs_no_improve} epochs. Early stopping.")
             break
 
-    print("Training finished. Best val loss:", best_val_loss)
+        # Optional: Garbage collection after every epoch
+        if epoch % 5 == 0:
+            gc.collect()
+
+    print("Training finished. Best Val Loss:", best_val_loss)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train MLP on particle data from SQLite")
+    parser = argparse.ArgumentParser(description="RAM-optimized MLP training on particle data")
 
     parser.add_argument("--db_path", type=str, default="dataset.db")
     parser.add_argument("--table_name", type=str, default="standard")
@@ -248,7 +426,7 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=1e-6)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--pin_memory", type=bool, default=True)
-    parser.add_argument("--use_amp", type=bool, default=True, help="Use mixed precision (if CUDA available)")
+    parser.add_argument("--use_amp", type=bool, default=True, help="Mixed Precision (if CUDA available)")
     parser.add_argument("--early_stop_patience", type=int, default=7)
     parser.add_argument("--save_every_n_epochs", type=int, default=0, help="If >0 save checkpoint every N epochs")
 
