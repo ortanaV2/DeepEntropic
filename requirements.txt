@@ -1,3 +1,6 @@
 torch==2.5.1
+# torch-cluster==1.6.3  # skipped for ci-pipeline
+torch-geometric==2.6.1
 matplotlib==3.7.1
 numpy==1.26.4
+tqdm==4.65.0
